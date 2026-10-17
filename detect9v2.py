@@ -1,0 +1,2922 @@
+
+import csv
+import bisect
+import json
+import math
+import os
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+import onnxruntime as ort
+import pynmea2
+import serial
+import tkinter as tk
+
+try:
+    from picamera2 import Picamera2
+except Exception:
+    Picamera2 = None
+from PIL import Image, ImageTk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkintermapview import TkinterMapView
+
+# Technical configuration (sesuai parameter pada laporan)
+MODEL_PATH = "v8s_320.onnx"  # model YOLOv8s yang diekspor ke ONNX
+VIDEO_PATH = "vid1.mp4"
+
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
+VIDEO_FPS = 24.0
+GPS_LOG_INTERVAL_S = 1.0  # simpan satu sampel GPS per detik (1 Hz)
+
+IMG_SIZE = 320  # ukuran input model; frame video tetap 1280 x 720
+CONF_THRESHOLD = 0.4
+IOU_THRESHOLD = 0.5
+SAVE_INTERVAL = 2.0
+
+CLASS_NAMES = [
+    "Longitudinal Crack",
+    "Transverse Crack",
+    "Alligator Crack",
+    "Potholes",
+]
+
+GPS_PORT = "/dev/ttyAMA0"
+GPS_BAUDRATE = 9600
+
+SESSION_ROOT = Path("sessions")
+SESSION_ROOT.mkdir(exist_ok=True)
+
+OUT_DIR = Path(".")
+DEFAULT_FRAME_CSV = "recorded_frames.csv"
+DEFAULT_GPS_CSV = "gps_log.csv"
+DEFAULT_DET_CSV = "detections.csv"
+SESSION_META = "session.json"
+DEFAULT_CAMERA_VIDEO = "camera_recording.mp4"
+
+# helpers
+def ensure_csv(path: Path, header: list[str]) -> None:
+    if not path.exists():
+        with path.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(header)
+
+
+def safe_float(value, default=None):
+    try:
+        if value in (None, "", "N/A"):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value, default=None):
+    try:
+        if value in (None, "", "N/A"):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def format_time(ts: float | None) -> str:
+    if ts is None:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_elapsed_timestamp(timestamp: float | None, start_timestamp: float | None) -> str:
+    """Format a Unix timestamp as HH:MM:SS.mmm relative to session start."""
+    if timestamp is None or start_timestamp is None:
+        return "-"
+    try:
+        elapsed = max(0.0, float(timestamp) - float(start_timestamp))
+    except (TypeError, ValueError):
+        return "-"
+    total_ms = int(round(elapsed * 1000.0))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
+def meters_to_lat_deg(meters: float) -> float:
+    return meters / 111320.0
+
+
+def meters_to_lng_deg(meters: float, lat_deg: float) -> float:
+    denom = 111320.0 * max(math.cos(math.radians(lat_deg)), 1e-8)
+    return meters / denom
+
+
+def sanitize_folder_name(name: str) -> str:
+    safe = "".join(c if c.isalnum() or c in ("-", "_", " ") else "_" for c in name.strip())
+    safe = "_".join(safe.split())
+    return safe or "session"
+
+
+def unique_session_dir(base_name: str) -> Path:
+    base = sanitize_folder_name(base_name)
+    candidate = SESSION_ROOT / base
+    idx = 2
+    while candidate.exists():
+        candidate = SESSION_ROOT / f"{base}_{idx}"
+        idx += 1
+    return candidate
+
+
+def preprocess(frame: np.ndarray) -> np.ndarray:
+    img = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.transpose(2, 0, 1)
+    img = img.astype(np.float32) / 255.0
+    img = np.expand_dims(img, axis=0)
+    return img
+
+
+def nms(boxes, scores):
+    if not boxes:
+        return []
+    idxs = cv2.dnn.NMSBoxes(boxes, scores, CONF_THRESHOLD, IOU_THRESHOLD)
+    if idxs is None or len(idxs) == 0:
+        return []
+    return idxs.flatten().tolist()
+
+
+def parse_gsv_signal(raw_sentence: str):
+    """
+    Parse $GxGSV. Returns:
+        satellites_in_view (int|None)
+        avg_snr (float|None)
+        max_snr (float|None)
+    """
+    try:
+        fields = raw_sentence.strip().split(",")
+        if len(fields) < 4:
+            return None, None, None
+
+        satellites_in_view = safe_int(fields[3], None)
+        snrs = []
+        for idx in range(7, len(fields), 4):
+            token = fields[idx].split("*")[0].strip()
+            if token.isdigit():
+                snrs.append(int(token))
+
+        avg_snr = float(sum(snrs) / len(snrs)) if snrs else None
+        max_snr = max(snrs) if snrs else None
+        return satellites_in_view, avg_snr, max_snr
+    except Exception:
+        return None, None, None
+
+
+def nmea_type(raw: str) -> str:
+    if not raw.startswith("$") or len(raw) < 6:
+        return "UNKNOWN"
+    return raw.split(",")[0][1:]
+
+
+def read_csv_dicts(path: Path):
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+# session manager
+class SessionManager:
+    def __init__(self, root_dir: Path):
+        self.root_dir = root_dir
+        self.root_dir.mkdir(exist_ok=True)
+
+    def list_sessions(self):
+        sessions = []
+        for p in sorted(self.root_dir.iterdir(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
+            if not p.is_dir():
+                continue
+            meta = self.load_meta(p)
+            sessions.append((p, meta))
+        return sessions
+
+    def load_meta(self, session_dir: Path):
+        meta_path = session_dir / SESSION_META
+        if meta_path.exists():
+            try:
+                return json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # fallback from filesystem
+        status = "new"
+        if (session_dir / DEFAULT_FRAME_CSV).exists() or (session_dir / DEFAULT_GPS_CSV).exists():
+            status = "recorded"
+        if (session_dir / DEFAULT_DET_CSV).exists():
+            status = "inferred"
+
+        return {
+            "session_name": session_dir.name,
+            "folder_name": session_dir.name,
+            "created_at": None,
+            "status": status,
+            "source_video": VIDEO_PATH,
+            "input_source": "DUMMY_VIDEO",
+            "input_source_label": "Dummy Video",
+            "camera_video": DEFAULT_CAMERA_VIDEO,
+            "inference_done": (session_dir / DEFAULT_DET_CSV).exists(),
+            "recording_done": (session_dir / DEFAULT_FRAME_CSV).exists() or (session_dir / DEFAULT_GPS_CSV).exists(),
+        }
+
+    def save_meta(self, session_dir: Path, meta: dict):
+        meta_path = session_dir / SESSION_META
+        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def create_session(self, name: str):
+        session_dir = unique_session_dir(name)
+        session_dir.mkdir(parents=True, exist_ok=False)
+
+        created_at = datetime.now().isoformat(timespec="seconds")
+        meta = {
+            "session_name": name.strip(),
+            "folder_name": session_dir.name,
+            "created_at": created_at,
+            "status": "recording",
+            "source_video": VIDEO_PATH,
+            "input_source": "DUMMY_VIDEO",
+            "input_source_label": "Dummy Video",
+            "camera_video": DEFAULT_CAMERA_VIDEO,
+            "inference_done": False,
+            "recording_done": False,
+        }
+        self.save_meta(session_dir, meta)
+
+        ensure_csv(
+            session_dir / DEFAULT_FRAME_CSV,
+            ["frame_index", "frame_timestamp"],
+        )
+        ensure_csv(
+            session_dir / DEFAULT_GPS_CSV,
+            [
+                "timestamp", "lat", "lng", "signal_dbhz", "num_sats", "fix_quality",
+                "hdop", "pdop", "vdop", "altitude", "geoid_sep",
+                "speed_knots", "speed_kmh", "course_deg", "gps_mode", "gps_pattern"
+            ],
+        )
+        ensure_csv(
+            session_dir / DEFAULT_DET_CSV,
+            [
+                "frame_index",
+                "frame_timestamp",
+                "frame_image",
+                "label",
+                "confidence",
+                "gps_before_timestamp",
+                "gps_after_timestamp",
+                "interp_lat",
+                "interp_lng",
+                "gps_before_lat",
+                "gps_before_lng",
+                "gps_after_lat",
+                "gps_after_lng",
+                "gps_before_signal_dbhz",
+                "gps_after_signal_dbhz",
+                "gps_mode",
+                "gps_pattern",
+            ],
+        )
+        return session_dir, meta
+
+    def update_status(self, session_dir: Path, status: str, **kwargs):
+        meta = self.load_meta(session_dir)
+        meta["status"] = status
+        if status == "inferred":
+            meta["inference_done"] = True
+        if status == "recorded":
+            meta["recording_done"] = True
+        meta.update(kwargs)
+        self.save_meta(session_dir, meta)
+        return meta
+
+    def load_session_payload(self, session_dir: Path):
+        meta = self.load_meta(session_dir)
+        frames = read_csv_dicts(session_dir / DEFAULT_FRAME_CSV)
+        gps = read_csv_dicts(session_dir / DEFAULT_GPS_CSV)
+        dets = read_csv_dicts(session_dir / DEFAULT_DET_CSV)
+        return meta, frames, gps, dets
+
+
+# program
+class DetectionApp:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Detection Logger")
+        self.root.geometry("1400x900")
+
+        self.session_manager = SessionManager(SESSION_ROOT)
+        # Cache session-relative timestamp origins, keyed by resolved session path.
+        self._session_start_timestamp_cache = {}
+
+        # init states
+        self.lock = threading.Lock()
+        self.shutdown_event = threading.Event()
+        self.stop_record_event = threading.Event()
+        self.stop_infer_event = threading.Event()
+        self.recording_active = False
+        self.inference_active = False
+        # Timestamp sampel GPS terakhir yang ditulis ke gps_log.csv.
+        self.last_gps_log_ts = None
+        # Recording uses playback_thread for historical compatibility.
+        # Replay has its own thread/state so recording and playback cannot
+        # accidentally share the same worker.
+        self.playback_thread = None
+        self.replay_thread = None
+        self.replay_active = False
+        self.stop_replay_event = threading.Event()
+        self.replay_session_dir = None
+        self.replay_current_lat = None
+        self.replay_current_lng = None
+        self.replay_frame_count = 0
+        self.replay_total_frames = 0
+        self.replay_started_at = None
+        self.replay_video_path = None
+        self.infer_thread = None
+        self.frame_display = None
+
+        # startup/runtime readiness
+        self.session = None
+        self.input_name = None
+        self.model_ready = threading.Event()
+        self.gps_thread_started = False
+        self.startup_complete = False
+
+        self.current_lat = -6.2
+        self.current_lng = 106.8
+        self.follow_gps = True
+
+        self.gps_mode = "ONLINE"   # ONLINE / OFFLINE
+        self.offline_pattern = "STRAIGHT"  # STRAIGHT / CIRCLE
+        self.offline_speed_mps = 5.0
+        self.offline_heading_deg = 45.0
+        self.offline_circle_radius_m = 30.0
+        self.offline_center_lat = self.current_lat
+        self.offline_center_lng = self.current_lng
+        self.offline_angle_rad = 0.0
+        self.offline_last_ts = time.time()
+        self.offline_straight_lat = self.current_lat
+        self.offline_straight_lng = self.current_lng
+
+        self.latest_signal_dbhz = None
+        self.latest_num_sats = None
+        self.latest_fix_quality = None
+        self.latest_hdop = None
+        self.latest_pdop = None
+        self.latest_vdop = None
+        self.latest_altitude = None
+        self.latest_geoid_sep = None
+        self.latest_speed_knots = None
+        self.latest_speed_kmh = None
+        self.latest_course_deg = None
+        self.latest_gll_status = None
+        self.latest_rmc_status = None
+        self.latest_satellites_in_view = None
+        self.latest_max_snr = None
+
+        self.gps_state = {
+            "mode": self.gps_mode,
+            "pattern": self.offline_pattern,
+            "last_sentence_type": "",
+            "last_raw_sentence": "",
+            "lat": self.current_lat,
+            "lng": self.current_lng,
+            "signal_dbhz": None,
+            "num_sats": None,
+            "fix_quality": None,
+            "hdop": None,
+            "pdop": None,
+            "vdop": None,
+            "altitude": None,
+            "geoid_sep": None,
+            "speed_knots": None,
+            "speed_kmh": None,
+            "course_deg": None,
+            "rmc_status": None,
+            "gll_status": None,
+            "gsv_satellites_in_view": None,
+            "gsv_avg_snr": None,
+            "gsv_max_snr": None,
+            "gsa_fix_type": None,
+        }
+
+        self.nmea_tail = deque(maxlen=10)
+
+        # session/runtime
+        self.selected_session_dir = None
+        self.current_session_dir = None
+        self.current_session_meta = None
+        self.session_frames = []
+        self.session_gps = []
+        self.session_detections = []
+        self.session_frame_count = 0
+
+        # video input selection for the active/new session
+        self.input_source = "DUMMY_VIDEO"  # DUMMY_VIDEO / RPI_CAMERA
+        self.input_source_label = "Dummy Video"
+
+        self.damage_markers = []
+        self.session_route_marker = None
+
+        # Build and show the GUI first. Do not perform heavy I/O/model loading
+        # synchronously before mainloop(), otherwise a temporary ONNX/runtime
+        # delay can make the application appear to have no GUI at all.
+        self._build_ui()
+        self._set_status("Starting GUI...")
+        self._set_preview_text("Preview: initializing...")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Schedule startup work only after Tk has entered its event loop.
+        # The window is explicitly deiconified/lifted first so a slow model or
+        # GPS initialization cannot make the application appear invisible.
+        self.root.after(10, self._show_window)
+        self.root.after(50, self._start_background_services)
+        self.root.after(100, self.update_ui)
+
+    # UI
+
+    def _build_ui(self):
+        # Root layout: fixed left sidebar, expandable map area
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=0, minsize=460)
+        self.root.grid_columnconfigure(1, weight=1)
+
+        # Scrollable left sidebar. The inner frame contains all existing controls;
+        # the canvas lets the user reach the NMEA/debug log on short displays.
+        self.sidebar_shell = tk.Frame(self.root, bg="white", width=460)
+        self.sidebar_shell.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_shell.grid_rowconfigure(0, weight=1)
+        self.sidebar_shell.grid_columnconfigure(0, weight=1)
+
+        self.sidebar_canvas = tk.Canvas(
+            self.sidebar_shell, bg="white", highlightthickness=0, borderwidth=0
+        )
+        self.sidebar_scrollbar = tk.Scrollbar(
+            self.sidebar_shell, orient="vertical", command=self.sidebar_canvas.yview
+        )
+        self.sidebar_canvas.configure(yscrollcommand=self.sidebar_scrollbar.set)
+        self.sidebar_canvas.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.sidebar_outer = tk.Frame(self.sidebar_canvas, bg="white")
+        self.sidebar_canvas_window = self.sidebar_canvas.create_window(
+            (0, 0), window=self.sidebar_outer, anchor="nw"
+        )
+        self.sidebar_outer.grid_columnconfigure(0, weight=1)
+        self.sidebar_outer.bind("<Configure>", self._on_sidebar_content_configure)
+        self.sidebar_canvas.bind("<Configure>", self._on_sidebar_canvas_configure)
+        # Mouse wheel support on Windows/macOS and Linux. Scrolling only takes
+        # effect while the pointer is over the left sidebar.
+        self.root.bind_all("<MouseWheel>", self._on_sidebar_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_sidebar_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._on_sidebar_mousewheel, add="+")
+
+        # map area
+        self.map_container = tk.Frame(self.root, bg="white")
+        self.map_container.grid(row=0, column=1, sticky="nsew")
+        self.map_container.grid_rowconfigure(0, weight=1)
+        self.map_container.grid_columnconfigure(0, weight=1)
+
+        self.map_widget = TkinterMapView(self.map_container)
+        self.map_widget.pack(fill="both", expand=True)
+        self.map_widget.set_position(self.current_lat, self.current_lng)
+        self.zoom_level = 15
+        self.map_widget.set_zoom(self.zoom_level)
+
+        self.live_marker = self.map_widget.set_marker(self.current_lat, self.current_lng, text="GPS Live")
+        self.damage_markers = []
+
+        # session & control
+        self.control_frame = tk.LabelFrame(self.sidebar_outer, text="Session & Control", bg="white")
+        self.control_frame.grid(row=0, column=0, padx=8, pady=8, sticky="nwe")
+        for c in range(4):
+            self.control_frame.grid_columnconfigure(c, weight=1)
+
+        session_list_container = tk.Frame(self.control_frame, bg="white")
+        session_list_container.grid(row=0, column=0, columnspan=4, padx=5, pady=5, sticky="we")
+        session_list_container.grid_columnconfigure(0, weight=1)
+        session_list_container.grid_rowconfigure(0, weight=1)
+
+        self.session_listbox = tk.Listbox(session_list_container, height=7, width=44, font=("Arial", 10))
+        self.session_listbox.grid(row=0, column=0, sticky="nsew")
+
+        self.session_list_vscroll = tk.Scrollbar(session_list_container, orient="vertical", command=self.session_listbox.yview)
+        self.session_list_vscroll.grid(row=0, column=1, sticky="ns")
+
+        self.session_list_hscroll = tk.Scrollbar(session_list_container, orient="horizontal", command=self.session_listbox.xview)
+        self.session_list_hscroll.grid(row=1, column=0, sticky="we")
+
+        self.session_listbox.configure(yscrollcommand=self.session_list_vscroll.set, xscrollcommand=self.session_list_hscroll.set)
+        self.session_listbox.bind("<<ListboxSelect>>", self.on_session_select)
+
+        btn_opts = dict(width=10, padx=2, pady=2, font=("Arial", 9))
+        self.new_btn = tk.Button(self.control_frame, text="New Session", command=self.new_session, **btn_opts)
+        self.new_btn.grid(row=1, column=0, padx=3, pady=3, sticky="we")
+
+        self.load_btn = tk.Button(self.control_frame, text="Load Session", command=self.load_selected_session, **btn_opts)
+        self.load_btn.grid(row=1, column=1, padx=3, pady=3, sticky="we")
+
+        self.refresh_btn = tk.Button(self.control_frame, text="Refresh", command=self.refresh_sessions, **btn_opts)
+        self.refresh_btn.grid(row=1, column=2, padx=3, pady=3, sticky="we")
+
+        self.center_btn = tk.Button(self.control_frame, text="Recenter", command=self.center_map, **btn_opts)
+        self.center_btn.grid(row=1, column=3, padx=3, pady=3, sticky="we")
+
+        self.start_record_btn = tk.Button(self.control_frame, text="Start Recording", command=self.start_recording_from_selection, **btn_opts)
+        self.start_record_btn.grid(row=2, column=0, padx=3, pady=3, sticky="we")
+
+        self.stop_record_btn = tk.Button(self.control_frame, text="Stop Recording", command=self.stop_recording, **btn_opts)
+        self.stop_record_btn.grid(row=2, column=1, padx=3, pady=3, sticky="we")
+
+        self.start_infer_btn = tk.Button(self.control_frame, text="Start Inference", command=self.start_inference, **btn_opts)
+        self.start_infer_btn.grid(row=2, column=2, padx=3, pady=3, sticky="we")
+
+        self.replot_btn = tk.Button(self.control_frame, text="Show Map", command=self.show_current_session_map, **btn_opts)
+        self.replot_btn.grid(row=2, column=3, padx=3, pady=3, sticky="we")
+
+        # Input source selection (available per session, before recording)
+        source_frame = tk.LabelFrame(self.control_frame, text="Video Input", bg="white")
+        source_frame.grid(row=3, column=0, columnspan=4, padx=5, pady=5, sticky="we")
+        for c in range(3):
+            source_frame.grid_columnconfigure(c, weight=1)
+
+        self.input_source_var = tk.StringVar(value="DUMMY_VIDEO")
+        tk.Radiobutton(
+            source_frame, text="Dummy Video (vid1.mp4)", variable=self.input_source_var,
+            value="DUMMY_VIDEO", command=self.on_input_source_change, bg="white"
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=3)
+        tk.Radiobutton(
+            source_frame, text="Raspberry Pi Camera", variable=self.input_source_var,
+            value="RPI_CAMERA", command=self.on_input_source_change, bg="white"
+        ).grid(row=0, column=2, sticky="w", padx=4, pady=3)
+
+        self.input_source_info_var = tk.StringVar(value="Input: Dummy Video | vid1.mp4")
+        tk.Label(
+            source_frame, textvariable=self.input_source_info_var, bg="white",
+            anchor="w", justify="left", wraplength=420
+        ).grid(row=1, column=0, columnspan=3, sticky="we", padx=4, pady=2)
+
+        # Recording playback controls
+        playback_frame = tk.LabelFrame(self.control_frame, text="Playback Rekaman", bg="white")
+        playback_frame.grid(row=4, column=0, columnspan=4, padx=5, pady=5, sticky="we")
+        for c in range(3):
+            playback_frame.grid_columnconfigure(c, weight=1)
+
+        self.playback_btn = tk.Button(
+            playback_frame, text="Play Recording", command=self.start_playback,
+            font=("Arial", 9), width=14, padx=2, pady=2
+        )
+        self.playback_btn.grid(row=0, column=0, padx=3, pady=3, sticky="we")
+
+        self.stop_playback_btn = tk.Button(
+            playback_frame, text="Stop Playback", command=self.stop_playback,
+            font=("Arial", 9), width=14, padx=2, pady=2
+        )
+        self.stop_playback_btn.grid(row=0, column=1, padx=3, pady=3, sticky="we")
+
+        self.playback_info_var = tk.StringVar(value="Playback: idle")
+        tk.Label(
+            playback_frame, textvariable=self.playback_info_var, bg="white",
+            anchor="w", justify="left", wraplength=420
+        ).grid(row=1, column=0, columnspan=3, padx=4, pady=2, sticky="we")
+
+        self.detection_list_btn = tk.Button(
+            playback_frame,
+            text="Daftar Kerusakan Terdeteksi",
+            command=self.show_detection_list,
+            font=("Arial", 9, "bold"),
+            padx=3,
+            pady=4,
+        )
+        self.detection_list_btn.grid(row=2, column=0, columnspan=3, padx=3, pady=(3, 5), sticky="we")
+
+        self.status_var = tk.StringVar(value="Status: Idle")
+        self.status_label = tk.Label(self.control_frame, textvariable=self.status_var, bg="white", anchor="w", justify="left", wraplength=420)
+        self.status_label.grid(row=5, column=0, columnspan=4, padx=5, pady=2, sticky="we")
+
+        self.session_var = tk.StringVar(value="Session: -")
+        self.session_label = tk.Label(self.control_frame, textvariable=self.session_var, bg="white", anchor="w", justify="left", wraplength=420)
+        self.session_label.grid(row=6, column=0, columnspan=4, padx=5, pady=2, sticky="we")
+
+        self.info_var = tk.StringVar(value="GPS: N/A")
+        self.info_label = tk.Label(self.control_frame, textvariable=self.info_var, bg="white", anchor="w", justify="left", wraplength=420)
+        self.info_label.grid(row=7, column=0, columnspan=4, padx=5, pady=2, sticky="we")
+
+        # GPS mode / dummy GPS control
+        mode_frame = tk.LabelFrame(self.sidebar_outer, text="GPS Mode", bg="white")
+        mode_frame.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="we")
+        for c in range(4):
+            mode_frame.grid_columnconfigure(c, weight=1)
+
+        self.gps_mode_var = tk.StringVar(value="ONLINE")
+        self.offline_pattern_var = tk.StringVar(value="STRAIGHT")
+        self.speed_var = tk.DoubleVar(value=5.0)
+        self.heading_var = tk.DoubleVar(value=45.0)
+        self.radius_var = tk.DoubleVar(value=30.0)
+
+        tk.Radiobutton(mode_frame, text="Online", variable=self.gps_mode_var, value="ONLINE", bg="white", command=self.on_mode_change).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        tk.Radiobutton(mode_frame, text="Offline", variable=self.gps_mode_var, value="OFFLINE", bg="white", command=self.on_mode_change).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        tk.Radiobutton(mode_frame, text="Straight", variable=self.offline_pattern_var, value="STRAIGHT", bg="white", command=self.on_mode_change).grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        tk.Radiobutton(mode_frame, text="Circle", variable=self.offline_pattern_var, value="CIRCLE", bg="white", command=self.on_mode_change).grid(row=1, column=1, sticky="w", padx=4, pady=2)
+
+        tk.Label(mode_frame, text="Speed m/s", bg="white").grid(row=2, column=0, sticky="w", padx=4)
+        tk.Spinbox(mode_frame, from_=0.5, to=30.0, increment=0.5, textvariable=self.speed_var, width=8, command=self.on_mode_change).grid(row=2, column=1, sticky="w", padx=4)
+        tk.Label(mode_frame, text="Heading", bg="white").grid(row=2, column=2, sticky="w", padx=4)
+        tk.Spinbox(mode_frame, from_=0, to=359, increment=5, textvariable=self.heading_var, width=8, command=self.on_mode_change).grid(row=2, column=3, sticky="w", padx=4)
+        tk.Label(mode_frame, text="Radius", bg="white").grid(row=3, column=0, sticky="w", padx=4)
+        tk.Spinbox(mode_frame, from_=5, to=200, increment=5, textvariable=self.radius_var, width=8, command=self.on_mode_change).grid(row=3, column=1, sticky="w", padx=4)
+
+        self.mode_info_var = tk.StringVar(value="Mode: ONLINE | Pattern: STRAIGHT")
+        tk.Label(mode_frame, textvariable=self.mode_info_var, bg="white", justify="left", wraplength=420).grid(row=4, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+
+        # GPS debug screen
+        self.gps_debug_frame = tk.LabelFrame(self.sidebar_outer, text="GPS Debug / NMEA", bg="white")
+        self.gps_debug_frame.grid(row=2, column=0, padx=8, pady=(0, 8), sticky="nsew")
+        self.sidebar_outer.grid_rowconfigure(2, weight=1)
+
+        self.gps_debug_text = tk.Text(self.gps_debug_frame, width=48, height=18, wrap="word")
+        self.gps_debug_text.pack(side="left", fill="both", expand=True)
+        self.gps_debug_text.configure(state="disabled")
+
+        scroll = tk.Scrollbar(self.gps_debug_frame, command=self.gps_debug_text.yview)
+        scroll.pack(side="right", fill="y")
+        self.gps_debug_text.configure(yscrollcommand=scroll.set)
+
+        # map overlay & controls
+        self.zoom_panel = tk.Frame(self.map_container, bg="white", bd=2, relief="raised")
+        self.zoom_panel.place(relx=1.0, x=-12, y=12, anchor="ne")
+
+        zoom_btn_style = dict(width=5, height=1, font=("Arial", 16, "bold"), bg="#f2f2f2", fg="black", relief="raised", bd=1, padx=2, pady=2)
+        tk.Button(self.zoom_panel, text="+", command=self.zoom_in, **zoom_btn_style).pack(fill="x", padx=2, pady=(2, 1))
+        tk.Button(self.zoom_panel, text="-", command=self.zoom_out, **zoom_btn_style).pack(fill="x", padx=2, pady=1)
+        tk.Button(self.zoom_panel, text="Center", command=self.center_map, **zoom_btn_style).pack(fill="x", padx=2, pady=(1, 2))
+
+        self.camera_frame = tk.Label(self.map_container, bg="black", bd=2, relief="solid")
+        self.camera_frame.place(relx=1.0, rely=1.0, anchor="se", width=360, height=240)
+
+        self.preview_var = tk.StringVar(value="Preview: -")
+        self.preview_label = tk.Label(self.map_container, textvariable=self.preview_var, bg="white", bd=1, relief="solid", anchor="w")
+        self.preview_label.place(relx=1.0, rely=1.0, x=-360, y=-250, anchor="sw", width=360, height=24)
+
+        self.refresh_sessions()
+    def _on_sidebar_content_configure(self, _event=None):
+        """Refresh the scroll region whenever sidebar content changes size."""
+        try:
+            self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _on_sidebar_canvas_configure(self, event):
+        """Keep the sidebar content as wide as the visible canvas."""
+        try:
+            self.sidebar_canvas.itemconfigure(self.sidebar_canvas_window, width=event.width)
+            self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _on_sidebar_mousewheel(self, event):
+        """Scroll the left panel on wheel input, but not when pointer is elsewhere."""
+        try:
+            x = self.root.winfo_pointerx()
+            y = self.root.winfo_pointery()
+            left = self.sidebar_shell.winfo_rootx()
+            top = self.sidebar_shell.winfo_rooty()
+            right = left + self.sidebar_shell.winfo_width()
+            bottom = top + self.sidebar_shell.winfo_height()
+            if not (left <= x <= right and top <= y <= bottom):
+                return None
+
+            # Preserve the GPS text widget's own scrolling when the pointer is
+            # over it; its dedicated scrollbar remains available as well.
+            widget = self.root.winfo_containing(x, y)
+            if widget is not None and (widget == self.gps_debug_text or str(widget).startswith(str(self.gps_debug_text) + ".")):
+                return None
+
+            if getattr(event, "num", None) == 4:
+                units = -1
+            elif getattr(event, "num", None) == 5:
+                units = 1
+            else:
+                delta = getattr(event, "delta", 0)
+                if not delta:
+                    return None
+                units = -1 if delta > 0 else 1
+                # Windows reports larger deltas; scroll proportionally without
+                # making small touchpad movement excessively fast.
+                if abs(delta) >= 120:
+                    units *= max(1, abs(delta) // 120)
+            self.sidebar_canvas.yview_scroll(units, "units")
+            return "break"
+        except (tk.TclError, AttributeError):
+            return None
+
+    def _load_model(self):
+        """Load the ONNX model without blocking the Tk main thread."""
+        self.model_ready.clear()
+        if not Path(MODEL_PATH).exists():
+            msg = f"File model tidak ditemukan: {MODEL_PATH}"
+            print(f"[MODEL ERROR] {msg}")
+            self.session = None
+            self.input_name = None
+            self.root.after(0, self._on_model_failed, msg)
+            return False
+
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 4
+        providers = ["CPUExecutionProvider"]
+        try:
+            session = ort.InferenceSession(MODEL_PATH, so, providers=providers)
+            input_name = session.get_inputs()[0].name
+            self.session = session
+            self.input_name = input_name
+            self.model_ready.set()
+            print("[MODEL] ONNX loaded:", MODEL_PATH)
+            self.root.after(0, self._on_model_ready)
+            return True
+        except Exception as e:
+            print("[MODEL ERROR]", e)
+            self.session = None
+            self.input_name = None
+            self.root.after(0, self._on_model_failed, str(e))
+            return False
+
+    def _on_model_ready(self):
+        if self.shutdown_event.is_set():
+            return
+        self._set_status("Ready")
+        self._set_preview_text("Preview: waiting for recording/inference")
+        try:
+            self.start_infer_btn.config(state="normal")
+        except Exception:
+            pass
+        self._set_model_ui_state(True)
+        print("[STARTUP] Model ready; application is ready.")
+
+    def _on_model_failed(self, error_text):
+        if self.shutdown_event.is_set():
+            return
+        self._set_status("Model load failed")
+        self._set_preview_text("Preview: model failed to load")
+        self._set_model_ui_state(False)
+        print(f"[STARTUP] Model unavailable: {error_text}")
+        try:
+            messagebox.showerror(
+                "Model Error",
+                "Model ONNX gagal dimuat. GUI tetap dijalankan, tetapi inferensi belum tersedia.\n\n"
+                f"Detail: {error_text}"
+            )
+        except Exception:
+            pass
+
+    def _set_model_ui_state(self, ready: bool):
+        """Enable/disable model-dependent inference controls safely on Tk thread."""
+        state = "normal" if ready else "disabled"
+        for attr in ("start_infer_btn",):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                try:
+                    widget.config(state=state)
+                except Exception:
+                    pass
+
+    def _show_window(self):
+        """Make the Tk window visible as soon as the event loop is alive."""
+        if self.shutdown_event.is_set():
+            return
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            # Give the window manager a chance to map the window in desktop
+            # environments where a newly-created Tk window can start behind
+            # the terminal. Turn topmost back off immediately after the lift.
+            self.root.attributes("-topmost", True)
+            self.root.after(250, lambda: self.root.attributes("-topmost", False))
+        except Exception as e:
+            print(f"[STARTUP] Window show warning: {e}")
+
+    def _start_background_services(self):
+        """Start non-GUI services only after the Tk event loop is alive."""
+        if self.shutdown_event.is_set() or self.startup_complete:
+            return
+
+        self.startup_complete = True
+        print("[STARTUP] GUI event loop is active.")
+        self._set_status("Loading model...")
+        self._set_preview_text("Preview: loading ONNX model...")
+
+        # Start ONNX initialization in a worker thread so a slow runtime/model
+        # startup can never prevent the GUI window from being displayed.
+        threading.Thread(
+            target=self._load_model,
+            name="ModelLoader",
+            daemon=True,
+        ).start()
+
+        # GPS initialization is also kept off the Tk thread. The worker itself
+        # already retries the serial connection, so the GUI remains usable when
+        # the receiver is disconnected.
+        if not self.gps_thread_started:
+            self.gps_thread_started = True
+            threading.Thread(
+                target=self.gps_thread,
+                name="GPSThread",
+                daemon=True,
+            ).start()
+
+    def on_input_source_change(self):
+        if self.replay_active or self.recording_active or self.inference_active:
+            # restore the active session selection while busy
+            try:
+                self.input_source_var.set(self.input_source)
+            except Exception:
+                pass
+            messagebox.showwarning("Video Input", "Sumber video tidak dapat diubah saat recording atau inference berjalan.")
+            return
+
+        self.input_source = self.input_source_var.get()
+        if self.input_source == "RPI_CAMERA":
+            self.input_source_label = "Raspberry Pi Camera"
+            self.input_source_info_var.set("Input: Raspberry Pi Camera")
+        else:
+            self.input_source_label = "Dummy Video"
+            self.input_source_info_var.set(f"Input: Dummy Video | {VIDEO_PATH}")
+
+        if self.current_session_dir is not None and not self.recording_active and not self.inference_active:
+            self.current_session_meta = self.session_manager.update_status(
+                self.current_session_dir,
+                self.current_session_meta.get("status", "ready") if self.current_session_meta else "ready",
+                input_source=self.input_source,
+                input_source_label=self.input_source_label,
+                source_video=VIDEO_PATH,
+            )
+
+    def on_mode_change(self):
+        self.gps_mode = self.gps_mode_var.get()
+        self.offline_pattern = self.offline_pattern_var.get()
+        self.offline_speed_mps = float(self.speed_var.get())
+        self.offline_heading_deg = float(self.heading_var.get())
+        self.offline_circle_radius_m = max(5.0, float(self.radius_var.get()))
+
+        if self.gps_mode == "OFFLINE":
+            self.offline_center_lat = self.current_lat
+            self.offline_center_lng = self.current_lng
+            self.offline_straight_lat = self.current_lat
+            self.offline_straight_lng = self.current_lng
+            self.offline_angle_rad = 0.0
+            self.offline_last_ts = time.time()
+
+        self.nmea_tail.appendleft(f"[MODE] {self.gps_mode} | PATH={self.offline_pattern} | speed={self.offline_speed_mps:.1f} m/s")
+        self.update_mode_info()
+
+    def update_mode_info(self):
+        self.mode_info_var.set(f"Mode: {self.gps_mode} | Pattern: {self.offline_pattern} | Speed: {self.offline_speed_mps:.1f} m/s")
+
+    def zoom_in(self):
+        self.zoom_level = min(self.zoom_level + 1, 20)
+        self.map_widget.set_zoom(self.zoom_level)
+
+    def zoom_out(self):
+        self.zoom_level = max(self.zoom_level - 1, 1)
+        self.map_widget.set_zoom(self.zoom_level)
+
+    def center_map(self):
+        self.follow_gps = True
+        if self.replay_active and self.replay_current_lat is not None and self.replay_current_lng is not None:
+            lat = self.replay_current_lat
+            lng = self.replay_current_lng
+            self.map_widget.set_position(lat, lng)
+            self.map_widget.set_zoom(self.zoom_level)
+            print(f"[MAP] Center replay -> {lat:.6f}, {lng:.6f}")
+            self._set_preview_text(f"Playback center -> {lat:.6f}, {lng:.6f}")
+            return
+        self.map_widget.set_position(self.current_lat, self.current_lng)
+        self.map_widget.set_zoom(self.zoom_level)
+        print(f"[MAP] Center -> {self.current_lat:.6f}, {self.current_lng:.6f}")
+        self._set_preview_text(f"Center map -> {self.current_lat:.6f}, {self.current_lng:.6f}")
+
+    def _set_status(self, text):
+        self.root.after(0, self.status_var.set, f"Status: {text}")
+
+    def _set_session_text(self, text):
+        self.root.after(0, self.session_var.set, text)
+
+    def _set_preview_text(self, text):
+        self.root.after(0, self.preview_var.set, text)
+
+    def _update_info(self):
+        signal_txt = "N/A" if self.latest_signal_dbhz is None else f"{self.latest_signal_dbhz:.1f} dB-Hz"
+        sats_txt = "N/A" if self.latest_num_sats is None else str(self.latest_num_sats)
+        fix_txt = "N/A" if self.latest_fix_quality is None else str(self.latest_fix_quality)
+        hdop_txt = "N/A" if self.latest_hdop is None else f"{self.latest_hdop:.2f}"
+        pdop_txt = "N/A" if self.latest_pdop is None else f"{self.latest_pdop:.2f}"
+        vdop_txt = "N/A" if self.latest_vdop is None else f"{self.latest_vdop:.2f}"
+        alt_txt = "N/A" if self.latest_altitude is None else f"{self.latest_altitude:.1f} m"
+        speed_txt = "N/A"
+        if self.latest_speed_knots is not None:
+            if self.latest_speed_kmh is not None:
+                speed_txt = f"{self.latest_speed_knots:.2f} kn / {self.latest_speed_kmh:.2f} km/h"
+            else:
+                speed_txt = f"{self.latest_speed_knots:.2f} kn"
+        course_txt = "N/A" if self.latest_course_deg is None else f"{self.latest_course_deg:.1f}°"
+
+        txt = (
+            f"Mode: {self.gps_mode} | Pattern: {self.offline_pattern}\n"
+            f"GPS: {self.current_lat:.6f}, {self.current_lng:.6f}\n"
+            f"Signal: {signal_txt} | Sats: {sats_txt} | Fix: {fix_txt}\n"
+            f"HDOP/PDOP/VDOP: {hdop_txt} / {pdop_txt} / {vdop_txt}\n"
+            f"Altitude: {alt_txt} | Speed: {speed_txt} | Course: {course_txt}"
+        )
+        self.info_var.set(txt)
+
+    def _refresh_gps_debug_text(self):
+        with self.lock:
+            state = dict(self.gps_state)
+            tail = list(self.nmea_tail)
+
+        lines = [
+            f"Mode        : {state.get('mode', 'N/A')}",
+            f"Pattern     : {state.get('pattern', 'N/A')}",
+            f"Sentence    : {state.get('last_sentence_type', 'N/A')}",
+            f"Raw         : {state.get('last_raw_sentence', 'N/A')}",
+            f"Lat/Lng     : {state.get('lat', 0.0):.6f}, {state.get('lng', 0.0):.6f}",
+            f"Signal      : {self.latest_signal_dbhz if self.latest_signal_dbhz is not None else 'N/A'} dB-Hz",
+            f"Sat in view : {state.get('gsv_satellites_in_view', 'N/A')}",
+            f"Fix quality : {state.get('fix_quality', 'N/A')}",
+            f"HDOP/PDOP/VDOP : {state.get('hdop', 'N/A')} / {state.get('pdop', 'N/A')} / {state.get('vdop', 'N/A')}",
+            f"Altitude    : {state.get('altitude', 'N/A')}",
+            f"Speed kn/kmh: {state.get('speed_knots', 'N/A')} / {state.get('speed_kmh', 'N/A')}",
+            f"Course      : {state.get('course_deg', 'N/A')}",
+            "",
+            "Recent NMEA / Debug:",
+        ]
+        lines.extend(tail if tail else ["(no data yet)"])
+
+        self.gps_debug_text.configure(state="normal")
+        self.gps_debug_text.delete("1.0", tk.END)
+        self.gps_debug_text.insert(tk.END, "\n".join(lines))
+        self.gps_debug_text.configure(state="disabled")
+
+    def refresh_sessions(self):
+        self.session_listbox.delete(0, tk.END)
+        self.session_items = []
+
+        sessions = self.session_manager.list_sessions()
+        for session_dir, meta in sessions:
+            status = meta.get("status", "new")
+            inferred = "✓" if meta.get("inference_done") else " "
+            recorded = "✓" if meta.get("recording_done") else " "
+            created = meta.get("created_at", "")
+            source_label = meta.get("input_source_label", "Dummy Video")
+            label = f"{session_dir.name} | {source_label} | rec:{recorded} inf:{inferred} | {status} | {created}"
+            self.session_listbox.insert(tk.END, label)
+            self.session_items.append((session_dir, meta))
+
+        if not sessions:
+            self._set_session_text("Session: -")
+            self.current_session_dir = None
+            self.current_session_meta = None
+            self._clear_session_overlays()
+            self._set_status("Idle")
+            return
+
+        # auto-select first session if none selected
+        if self.session_listbox.curselection() == ():
+            self.session_listbox.selection_set(0)
+        self.on_session_select()
+
+    def on_session_select(self, event=None):
+        sel = self.session_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(getattr(self, "session_items", [])):
+            return
+
+        session_dir, meta = self.session_items[idx]
+        self.selected_session_dir = session_dir
+        self.input_source = meta.get("input_source", "DUMMY_VIDEO")
+        self.input_source_label = meta.get("input_source_label", "Dummy Video")
+        self.input_source_var.set(self.input_source)
+        self.input_source_info_var.set(
+            "Input: Raspberry Pi Camera" if self.input_source == "RPI_CAMERA"
+            else f"Input: Dummy Video | {VIDEO_PATH}"
+        )
+
+        info = (
+            f"Session: {session_dir.name}\n"
+            f"Name: {meta.get('session_name', session_dir.name)}\n"
+            f"Status: {meta.get('status', 'new')}\n"
+            f"Created: {meta.get('created_at', '-')}\n"
+            f"Inference: {'done' if meta.get('inference_done') else 'not yet'}\n"
+            f"Input: {meta.get('input_source_label', 'Dummy Video')}"
+        )
+        self._set_session_text(info)
+
+        # if inferred, show map automatically
+        if meta.get("inference_done"):
+            self.load_session_to_map(session_dir)
+            self.start_infer_btn.config(state="disabled")
+        else:
+            self.start_infer_btn.config(state="normal")
+
+    def choose_video_source_dialog(self):
+        """Ask which video source will be used for the newly created session."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Pilih Input Video")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        value = tk.StringVar(value=self.input_source)
+        tk.Label(
+            dialog, text="Pilih sumber video untuk sesi ini:",
+            font=("Arial", 11, "bold")
+        ).pack(anchor="w", padx=15, pady=(15, 8))
+
+        tk.Radiobutton(
+            dialog, text=f"Dummy Video ({VIDEO_PATH})",
+            variable=value, value="DUMMY_VIDEO"
+        ).pack(anchor="w", padx=20, pady=3)
+        tk.Radiobutton(
+            dialog, text="Raspberry Pi Camera",
+            variable=value, value="RPI_CAMERA"
+        ).pack(anchor="w", padx=20, pady=3)
+
+        result = {"ok": False}
+
+        def confirm():
+            self.input_source = value.get()
+            self.input_source_label = (
+                "Raspberry Pi Camera" if self.input_source == "RPI_CAMERA"
+                else "Dummy Video"
+            )
+            result["ok"] = True
+            dialog.destroy()
+
+        btn = tk.Frame(dialog)
+        btn.pack(fill="x", padx=15, pady=15)
+        tk.Button(btn, text="Lanjut", width=12, command=confirm).pack(side="right")
+        tk.Button(btn, text="Batal", width=12, command=dialog.destroy).pack(side="right", padx=(0, 8))
+
+        self.root.wait_window(dialog)
+        return result["ok"]
+
+    # playback
+    def _get_session_video_source(self, session_dir: Path, meta: dict):
+        """Resolve the actual video file belonging to a recorded session."""
+        input_source = meta.get("input_source", "DUMMY_VIDEO")
+        if input_source == "RPI_CAMERA":
+            camera_video = session_dir / DEFAULT_CAMERA_VIDEO
+            if camera_video.exists():
+                return str(camera_video)
+
+        source_video = meta.get("source_video", VIDEO_PATH)
+        source_path = Path(source_video)
+        if not source_path.is_absolute():
+            source_path = Path.cwd() / source_path
+        if source_path.exists():
+            return str(source_path)
+
+        fallback = Path(VIDEO_PATH)
+        if fallback.exists():
+            return str(fallback)
+        return str(source_path)
+
+    def _load_replay_gps(self, session_dir: Path):
+        """Load and sort valid GPS samples for replay interpolation."""
+        rows = read_csv_dicts(session_dir / DEFAULT_GPS_CSV)
+        gps = []
+        for row in rows:
+            ts = safe_float(row.get("timestamp"), None)
+            lat = safe_float(row.get("lat"), None)
+            lng = safe_float(row.get("lng"), None)
+            if ts is None or lat is None or lng is None:
+                continue
+            gps.append({"timestamp": ts, "lat": lat, "lng": lng})
+        gps.sort(key=lambda x: x["timestamp"])
+        return gps
+
+    def _interpolate_replay_gps(self, frame_ts: float, gps_obs: list):
+        """Interpolate recorded GPS position for one replay frame timestamp."""
+        if not gps_obs:
+            return None, None
+        if len(gps_obs) == 1:
+            return gps_obs[0]["lat"], gps_obs[0]["lng"]
+
+        times = [g["timestamp"] for g in gps_obs]
+        idx = bisect.bisect_left(times, frame_ts)
+        if idx <= 0:
+            g0, g1 = gps_obs[0], gps_obs[1]
+        elif idx >= len(gps_obs):
+            g0, g1 = gps_obs[-2], gps_obs[-1]
+        else:
+            g0, g1 = gps_obs[idx - 1], gps_obs[idx]
+        return self.interpolate_coord(frame_ts, g0, g1)[:2]
+
+    def _set_replay_map_position(self, lat: float, lng: float, frame_index: int, total_frames: int):
+        """Move the map marker to the recorded GPS point on the Tk thread."""
+        if self.shutdown_event.is_set() or not self.replay_active:
+            return
+        try:
+            self.replay_current_lat = lat
+            self.replay_current_lng = lng
+            self.live_marker.set_position(lat, lng)
+            self.map_widget.set_position(lat, lng)
+            self.map_widget.set_zoom(self.zoom_level)
+            self.playback_info_var.set(
+                f"Playback: frame {frame_index + 1}/{total_frames} | GPS {lat:.6f}, {lng:.6f}"
+            )
+        except Exception as e:
+            print(f"[PLAYBACK MAP ERROR] {e}")
+
+    def _resume_live_gps_map(self):
+        """Return map control to real/offline GPS after replay stops/ends."""
+        self.replay_active = False
+        self.replay_session_dir = None
+        self.replay_video_path = None
+        self.replay_current_lat = None
+        self.replay_current_lng = None
+        self.follow_gps = True
+        try:
+            self.playback_info_var.set("Playback: idle | Live GPS resumed")
+            self.live_marker.set_position(self.current_lat, self.current_lng)
+            self.map_widget.set_position(self.current_lat, self.current_lng)
+            self.map_widget.set_zoom(self.zoom_level)
+        except Exception as e:
+            print(f"[PLAYBACK RESUME MAP ERROR] {e}")
+
+    def start_playback(self):
+        if self.recording_active:
+            messagebox.showwarning("Playback", "Perekaman masih berjalan. Hentikan recording terlebih dahulu.")
+            return
+        if self.inference_active:
+            messagebox.showwarning("Playback", "Inference masih berjalan. Tunggu hingga selesai terlebih dahulu.")
+            return
+        if self.replay_active:
+            return
+
+        session_dir = self.selected_session_dir or self.current_session_dir
+        if session_dir is None:
+            messagebox.showinfo("Playback", "Pilih atau muat sesi terlebih dahulu.")
+            return
+
+        meta = self.session_manager.load_meta(session_dir)
+        frames = read_csv_dicts(session_dir / DEFAULT_FRAME_CSV)
+        gps_obs = self._load_replay_gps(session_dir)
+        if not frames:
+            messagebox.showwarning("Playback", "Data frame rekaman tidak ditemukan untuk sesi ini.")
+            return
+        if not gps_obs:
+            messagebox.showwarning("Playback", "Data GPS rekaman tidak ditemukan atau tidak valid.")
+            return
+
+        video_source = self._get_session_video_source(session_dir, meta)
+        if not Path(video_source).exists():
+            messagebox.showerror("Playback", f"File video rekaman tidak ditemukan:\n{video_source}")
+            return
+
+        frame_timestamps = []
+        for row in frames:
+            ts = safe_float(row.get("frame_timestamp"), None)
+            if ts is not None:
+                frame_timestamps.append(ts)
+        if not frame_timestamps:
+            messagebox.showwarning("Playback", "Timestamp frame rekaman tidak tersedia.")
+            return
+
+        self.selected_session_dir = session_dir
+        self.current_session_dir = session_dir
+        self.current_session_meta = meta
+        self.replay_session_dir = session_dir
+        self.replay_video_path = video_source
+        self.stop_replay_event.clear()
+        self.replay_active = True
+        self.follow_gps = True
+        self.replay_frame_count = 0
+        self.replay_total_frames = len(frame_timestamps)
+
+        try:
+            self.playback_btn.config(state="disabled")
+            self.stop_playback_btn.config(state="normal")
+            self.new_btn.config(state="disabled")
+            self.load_btn.config(state="disabled")
+            self.start_record_btn.config(state="disabled")
+            self.stop_record_btn.config(state="disabled")
+            self.start_infer_btn.config(state="disabled")
+        except Exception:
+            pass
+
+        self._set_status(f"Playback: {session_dir.name}")
+        self._set_preview_text(f"Playback: {session_dir.name}")
+        self.playback_info_var.set("Playback: starting...")
+
+        self.replay_thread = threading.Thread(
+            target=self._playback_session_worker,
+            args=(session_dir, frame_timestamps, gps_obs, video_source),
+            name="ReplayThread",
+            daemon=True,
+        )
+        self.replay_thread.start()
+
+    def stop_playback(self):
+        if not self.replay_active:
+            self._resume_live_gps_map()
+            return
+        self.stop_replay_event.set()
+        self._set_status("Stopping playback...")
+        self.playback_info_var.set("Playback: stopping...")
+
+    def _playback_session_worker(self, session_dir: Path, frame_timestamps: list, gps_obs: list, video_source: str):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(video_source)
+            if not cap.isOpened():
+                raise RuntimeError(f"Tidak bisa membuka video: {video_source}")
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if not fps or fps <= 1.0:
+                fps = VIDEO_FPS
+
+            first_ts = frame_timestamps[0]
+            playback_wall_start = time.monotonic()
+            frame_idx = 0
+            print(f"[PLAYBACK] Start session={session_dir.name} video={video_source} fps={fps:.2f} frames_logged={len(frame_timestamps)}")
+
+            while not self.shutdown_event.is_set() and not self.stop_replay_event.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    print("[PLAYBACK] End of video reached.")
+                    break
+
+                frame_ts = frame_timestamps[frame_idx] if frame_idx < len(frame_timestamps) else first_ts + (frame_idx / fps)
+                target_elapsed = max(0.0, frame_ts - first_ts)
+                now_elapsed = time.monotonic() - playback_wall_start
+                wait_s = target_elapsed - now_elapsed
+                if wait_s > 0.0:
+                    self.stop_replay_event.wait(min(wait_s, 0.05))
+                    if self.stop_replay_event.is_set() or self.shutdown_event.is_set():
+                        break
+
+                lat, lng = self._interpolate_replay_gps(frame_ts, gps_obs)
+                if lat is not None and lng is not None:
+                    self.root.after(0, self._set_replay_map_position, lat, lng, frame_idx, len(frame_timestamps))
+
+                preview = self._annotate_phase(frame, f"PLAYBACK | frame={frame_idx}", frame_ts, (0, 255, 255))
+                self._display_frame(preview)
+                frame_idx += 1
+                self.replay_frame_count = frame_idx
+
+            completed = (not self.stop_replay_event.is_set()) and (not self.shutdown_event.is_set())
+            print(f"[PLAYBACK] Finished frame_count={frame_idx} completed={completed}")
+            if not self.shutdown_event.is_set():
+                self.root.after(0, self._finish_playback_ui, completed, frame_idx, session_dir)
+
+        except Exception as e:
+            print(f"[PLAYBACK ERROR] {e}")
+            self.nmea_tail.appendleft(f"[PLAYBACK ERROR] {e}")
+            if not self.shutdown_event.is_set():
+                self.root.after(0, self._finish_playback_error, str(e))
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+    def _finish_playback_ui(self, completed: bool, frame_count: int, session_dir: Path):
+        self.replay_active = False
+        self.stop_replay_event.clear()
+        self.replay_thread = None
+        self._resume_live_gps_map()
+
+        try:
+            self.playback_btn.config(state="normal")
+            self.stop_playback_btn.config(state="normal")
+            self.new_btn.config(state="normal")
+            self.load_btn.config(state="normal")
+            self.start_record_btn.config(state="normal")
+            self.stop_record_btn.config(state="normal")
+            meta = self.session_manager.load_meta(session_dir)
+            self.start_infer_btn.config(
+                state="normal" if not meta.get("inference_done") and self.model_ready.is_set() else "disabled"
+            )
+        except Exception:
+            pass
+
+        if completed:
+            self._set_status(f"Playback finished: {session_dir.name}")
+            self._set_preview_text(f"Playback finished: {session_dir.name} | live GPS resumed")
+            self.playback_info_var.set(f"Playback: selesai | {frame_count} frame | Live GPS resumed")
+        else:
+            self._set_status(f"Playback stopped: {session_dir.name}")
+            self._set_preview_text(f"Playback stopped: {session_dir.name} | live GPS resumed")
+            self.playback_info_var.set(f"Playback: stopped | {frame_count} frame | Live GPS resumed")
+
+    def _finish_playback_error(self, error_text: str):
+        self.replay_active = False
+        self.stop_replay_event.clear()
+        self.replay_thread = None
+        self._resume_live_gps_map()
+        try:
+            self.playback_btn.config(state="normal")
+            self.stop_playback_btn.config(state="normal")
+            self.new_btn.config(state="normal")
+            self.load_btn.config(state="normal")
+            self.start_record_btn.config(state="normal")
+            self.stop_record_btn.config(state="normal")
+            self.start_infer_btn.config(state="normal" if self.model_ready.is_set() else "disabled")
+        except Exception:
+            pass
+        self._set_status("Playback error")
+        self._set_preview_text("Playback error | live GPS resumed")
+        self.playback_info_var.set("Playback: error | Live GPS resumed")
+        messagebox.showerror("Playback Error", error_text)
+
+    def new_session(self):
+        if self.recording_active or self.inference_active:
+            messagebox.showwarning("Busy", "Sesi sedang berjalan. Hentikan dulu sebelum membuat sesi baru.")
+            return
+
+        name = simpledialog.askstring("Nama Sesi", "Masukkan nama sesi perekaman:")
+        if not name:
+            return
+
+        session_dir, meta = self.session_manager.create_session(name)
+        self.current_session_dir = session_dir
+        self.current_session_meta = meta
+        self.selected_session_dir = session_dir
+
+        # Choose video source after the session has been created.
+        if not self.choose_video_source_dialog():
+            self.current_session_meta = self.session_manager.update_status(
+                session_dir, "ready", recording_done=False, inference_done=False
+            )
+            self._set_session_text(
+                f"Session: {session_dir.name}\nName: {name}\nStatus: ready\nInput: not selected\nCreated: {meta.get('created_at')}"
+            )
+            self._set_status("Idle - recording not started")
+            self.refresh_sessions()
+            return
+
+        self.input_source_var.set(self.input_source)
+        self.input_source_info_var.set(
+            "Input: Raspberry Pi Camera" if self.input_source == "RPI_CAMERA"
+            else f"Input: Dummy Video | {VIDEO_PATH}"
+        )
+        self.current_session_meta = self.session_manager.update_status(
+            session_dir, "recording",
+            input_source=self.input_source,
+            input_source_label=self.input_source_label,
+            source_video=VIDEO_PATH,
+        )
+        self.follow_gps = True
+        self._set_session_text(
+            f"Session: {session_dir.name}\nName: {name}\nStatus: recording\nInput: {self.input_source_label}\nCreated: {meta.get('created_at')}"
+        )
+        self.refresh_sessions()
+        # re-select newest/current
+        for i, (sd, _) in enumerate(self.session_items):
+            if sd == session_dir:
+                self.session_listbox.selection_clear(0, tk.END)
+                self.session_listbox.selection_set(i)
+                self.session_listbox.see(i)
+                break
+
+        self.start_recording_thread()
+
+    def load_selected_session(self):
+        if self.replay_active:
+            messagebox.showwarning("Busy", "Playback sedang berjalan. Hentikan playback terlebih dahulu sebelum memuat sesi lain.")
+            return
+        if self.recording_active or self.inference_active:
+            messagebox.showwarning("Busy", "Sesi sedang berjalan. Hentikan dulu sebelum memuat sesi lain.")
+            return
+
+        if self.selected_session_dir is None:
+            messagebox.showinfo("Session", "Pilih sesi dari daftar terlebih dahulu.")
+            return
+
+        session_dir = self.selected_session_dir
+        meta = self.session_manager.load_meta(session_dir)
+        self.current_session_dir = session_dir
+        self.current_session_meta = meta
+        self.input_source = meta.get("input_source", "DUMMY_VIDEO")
+        self.input_source_label = meta.get("input_source_label", "Dummy Video")
+        self.input_source_var.set(self.input_source)
+        self.input_source_info_var.set(
+            "Input: Raspberry Pi Camera" if self.input_source == "RPI_CAMERA"
+            else f"Input: Dummy Video | {VIDEO_PATH}"
+        )
+
+        self._set_session_text(
+            f"Session: {session_dir.name}\nName: {meta.get('session_name', session_dir.name)}\nStatus: {meta.get('status', '-')}\nCreated: {meta.get('created_at', '-')}"
+        )
+        self.follow_gps = False
+        self._clear_session_overlays()
+
+        if meta.get("inference_done") and (session_dir / DEFAULT_DET_CSV).exists():
+            self.load_session_to_map(session_dir)
+            self.start_infer_btn.config(state="disabled")
+        else:
+            # show GPS log / status only; inference can be started
+            self.show_session_status_only(session_dir)
+            self.start_infer_btn.config(state="normal")
+            messagebox.showinfo(
+                "Session Loaded",
+                "Sesi dimuat. Jika inference belum selesai, tekan tombol Start Inference."
+            )
+
+    def show_current_session_map(self):
+        if self.current_session_dir and (self.current_session_dir / DEFAULT_DET_CSV).exists():
+            self.load_session_to_map(self.current_session_dir)
+        elif self.current_session_dir and (self.current_session_dir / DEFAULT_GPS_CSV).exists():
+            self.show_session_status_only(self.current_session_dir)
+        else:
+            messagebox.showinfo("Map", "Belum ada data sesi untuk ditampilkan.")
+
+    def start_recording_from_selection(self):
+        # kept for compatibility: if user selected a session that is brand-new/new, allow recording
+        if self.current_session_dir is None:
+            messagebox.showinfo("Recording", "Buat sesi baru terlebih dahulu.")
+            return
+        meta = self.session_manager.load_meta(self.current_session_dir)
+        if meta.get("status") == "inferred":
+            messagebox.showinfo("Recording", "Sesi ini sudah selesai inferensi. Buat sesi baru untuk perekaman baru.")
+            return
+        if self.recording_active:
+            return
+        self.start_recording_thread()
+
+    def stop_recording(self):
+        if not self.recording_active:
+            messagebox.showinfo("Recording", "Tidak ada perekaman yang sedang berjalan.")
+            return
+        self.stop_record_event.set()
+        self._set_status("Stopping recording...")
+        self._set_preview_text("Stopping recording...")
+
+    def start_inference(self):
+        if self.replay_active:
+            messagebox.showwarning("Inference", "Playback sedang berjalan. Hentikan playback terlebih dahulu.")
+            return
+        if self.inference_active:
+            return
+        if self.current_session_dir is None:
+            messagebox.showinfo("Inference", "Pilih atau buat sesi terlebih dahulu.")
+            return
+
+        meta = self.session_manager.load_meta(self.current_session_dir)
+        if not (self.current_session_dir / DEFAULT_FRAME_CSV).exists():
+            messagebox.showwarning("Inference", "Data frame belum ada. Rekam sesi terlebih dahulu.")
+            return
+
+        if not messagebox.askyesno("Konfirmasi Inferensi", "Mulai inferensi untuk sesi ini?"):
+            return
+
+        self.start_infer_btn.config(state="disabled")
+        self.infer_thread = threading.Thread(target=self.run_inference_for_current_session, daemon=True)
+        self.infer_thread.start()
+
+    # GPS update
+    def gps_thread(self):
+        print("[GPS] Thread started")
+        ser = None
+        last_serial_try = 0.0
+
+        while not self.shutdown_event.is_set():
+            try:
+                if self.gps_mode == "OFFLINE":
+                    if ser is not None:
+                        try:
+                            ser.close()
+                        except Exception:
+                            pass
+                        ser = None
+                    self._offline_step()
+                    time.sleep(1.0)
+                    continue
+
+                # GPS online mode
+                if ser is None:
+                    if time.time() - last_serial_try < 2.0:
+                        time.sleep(0.1)
+                        continue
+                    last_serial_try = time.time()
+                    try:
+                        ser = serial.Serial(GPS_PORT, baudrate=GPS_BAUDRATE, timeout=1)
+                        print(f"[GPS] Connected to {GPS_PORT} @ {GPS_BAUDRATE}")
+                    except Exception as e:
+                        print("[GPS ERROR - SERIAL]", e)
+                        self.nmea_tail.appendleft("[GPS] serial open failed; waiting...")
+                        self.root.after(0, self._refresh_gps_debug_text)
+                        time.sleep(1.0)
+                        continue
+
+                raw = ser.readline()
+                if not raw:
+                    continue
+
+                data = raw.decode("ascii", errors="ignore").strip()
+                if not data.startswith("$"):
+                    continue
+
+                stype = nmea_type(data)
+
+                if stype in ("GPGSV", "GNGSV", "GSV"):
+                    sats_in_view, avg_snr, max_snr = parse_gsv_signal(data)
+                    self.latest_satellites_in_view = sats_in_view
+                    self.latest_signal_dbhz = avg_snr
+                    self.latest_max_snr = max_snr
+                    with self.lock:
+                        self.gps_state["gsv_satellites_in_view"] = sats_in_view
+                        self.gps_state["gsv_avg_snr"] = avg_snr
+                        self.gps_state["gsv_max_snr"] = max_snr
+                        self.gps_state["signal_dbhz"] = avg_snr
+                    print(f"[GPS GSV] sats_in_view={sats_in_view} avg_snr={avg_snr} max_snr={max_snr}")
+
+                try:
+                    msg = pynmea2.parse(data)
+                except Exception:
+                    self._append_debug_sentence(data)
+                    continue
+
+                self._update_state_from_sentence(data, msg=msg)
+
+            except Exception as e:
+                print("[GPS ERROR]", e)
+                self.nmea_tail.appendleft(f"[GPS ERROR] {e}")
+                self.root.after(0, self._refresh_gps_debug_text)
+                time.sleep(0.2)
+
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _append_debug_sentence(self, sentence: str):
+        self.nmea_tail.appendleft(sentence[:180])
+        self.root.after(0, self._refresh_gps_debug_text)
+
+    def _update_state_from_sentence(self, raw: str, msg=None):
+        stype = nmea_type(raw)
+        now = time.time()
+
+        with self.lock:
+            self.gps_state["last_sentence_type"] = stype
+            self.gps_state["last_raw_sentence"] = raw
+            self.gps_state["mode"] = self.gps_mode
+            self.gps_state["pattern"] = self.offline_pattern
+
+        if stype in ("GPRMC", "GNRMC", "RMC"):
+            try:
+                if msg is None:
+                    msg = pynmea2.parse(raw)
+                self.latest_rmc_status = getattr(msg, "status", None)
+                self.latest_speed_knots = safe_float(getattr(msg, "spd_over_grnd", None), self.latest_speed_knots)
+                self.latest_course_deg = safe_float(getattr(msg, "true_course", None), self.latest_course_deg)
+
+                with self.lock:
+                    self.gps_state["rmc_status"] = self.latest_rmc_status
+                    self.gps_state["speed_knots"] = self.latest_speed_knots
+                    self.gps_state["course_deg"] = self.latest_course_deg
+
+                if getattr(msg, "status", "V") == "A":
+                    lat = safe_float(getattr(msg, "latitude", None), None)
+                    lng = safe_float(getattr(msg, "longitude", None), None)
+                    if lat not in (None, 0.0) and lng not in (None, 0.0):
+                        self.current_lat = lat
+                        self.current_lng = lng
+                        with self.lock:
+                            self.gps_state["lat"] = lat
+                            self.gps_state["lng"] = lng
+                    print(f"[GPS RMC] status={self.latest_rmc_status} lat={self.current_lat:.6f} lng={self.current_lng:.6f}")
+                else:
+                    print(f"[GPS RMC] no fix | status={self.latest_rmc_status}")
+            except Exception as e:
+                print("[GPS RMC ERROR]", e)
+
+        elif stype in ("GPVTG", "GNVTG", "VTG"):
+            try:
+                if msg is None:
+                    msg = pynmea2.parse(raw)
+                self.latest_course_deg = safe_float(getattr(msg, "true_track", None), self.latest_course_deg)
+                self.latest_speed_knots = safe_float(getattr(msg, "spd_over_grnd_kts", None), self.latest_speed_knots)
+                self.latest_speed_kmh = safe_float(getattr(msg, "spd_over_grnd_kmph", None), self.latest_speed_kmh)
+                with self.lock:
+                    self.gps_state["speed_knots"] = self.latest_speed_knots
+                    self.gps_state["speed_kmh"] = self.latest_speed_kmh
+                    self.gps_state["course_deg"] = self.latest_course_deg
+                print(f"[GPS VTG] speed={self.latest_speed_knots} kn | course={self.latest_course_deg}")
+            except Exception as e:
+                print("[GPS VTG ERROR]", e)
+
+        elif stype in ("GPGGA", "GNGGA", "GGA"):
+            try:
+                if msg is None:
+                    msg = pynmea2.parse(raw)
+                self.latest_fix_quality = safe_int(getattr(msg, "gps_qual", None), None)
+                self.latest_num_sats = safe_int(getattr(msg, "num_sats", None), None)
+                self.latest_hdop = safe_float(getattr(msg, "horizontal_dil", None), None)
+                self.latest_altitude = safe_float(getattr(msg, "altitude", None), None)
+                self.latest_geoid_sep = safe_float(getattr(msg, "geo_sep", None), None)
+
+                lat = safe_float(getattr(msg, "latitude", None), None)
+                lng = safe_float(getattr(msg, "longitude", None), None)
+                if lat not in (None, 0.0) and lng not in (None, 0.0):
+                    self.current_lat = lat
+                    self.current_lng = lng
+                    with self.lock:
+                        self.gps_state["lat"] = lat
+                        self.gps_state["lng"] = lng
+
+                with self.lock:
+                    self.gps_state["fix_quality"] = self.latest_fix_quality
+                    self.gps_state["num_sats"] = self.latest_num_sats
+                    self.gps_state["hdop"] = self.latest_hdop
+                    self.gps_state["altitude"] = self.latest_altitude
+                    self.gps_state["geoid_sep"] = self.latest_geoid_sep
+
+                print(
+                    f"[GPS GGA] fix={self.latest_fix_quality} sats={self.latest_num_sats} "
+                    f"hdop={self.latest_hdop} alt={self.latest_altitude} "
+                    f"lat={self.current_lat:.6f} lng={self.current_lng:.6f}"
+                )
+            except Exception as e:
+                print("[GPS GGA ERROR]", e)
+
+        elif stype in ("GPGSA", "GNGSA", "GSA"):
+            try:
+                if msg is None:
+                    msg = pynmea2.parse(raw)
+                fix_type = safe_int(getattr(msg, "mode_fix_type", None), None)
+                self.latest_pdop = safe_float(getattr(msg, "pdop", None), None)
+                self.latest_hdop = safe_float(getattr(msg, "hdop", None), None)
+                self.latest_vdop = safe_float(getattr(msg, "vdop", None), None)
+
+                with self.lock:
+                    self.gps_state["gsa_fix_type"] = fix_type
+                    self.gps_state["pdop"] = self.latest_pdop
+                    self.gps_state["hdop"] = self.latest_hdop
+                    self.gps_state["vdop"] = self.latest_vdop
+
+                print(f"[GPS GSA] fix_type={fix_type} pdop={self.latest_pdop} hdop={self.latest_hdop} vdop={self.latest_vdop}")
+            except Exception as e:
+                print("[GPS GSA ERROR]", e)
+
+        elif stype in ("GPGSV", "GNGSV", "GSV"):
+            try:
+                sats_in_view, avg_snr, max_snr = parse_gsv_signal(raw)
+                self.latest_satellites_in_view = sats_in_view
+                self.latest_signal_dbhz = avg_snr
+                self.latest_max_snr = max_snr
+                with self.lock:
+                    self.gps_state["gsv_satellites_in_view"] = sats_in_view
+                    self.gps_state["gsv_avg_snr"] = avg_snr
+                    self.gps_state["gsv_max_snr"] = max_snr
+                    self.gps_state["signal_dbhz"] = avg_snr
+                print(f"[GPS GSV] sats_in_view={sats_in_view} avg_snr={avg_snr} max_snr={max_snr}")
+            except Exception as e:
+                print("[GPS GSV ERROR]", e)
+
+        elif stype in ("GPGLL", "GNGLL", "GLL"):
+            try:
+                if msg is None:
+                    msg = pynmea2.parse(raw)
+                self.latest_gll_status = getattr(msg, "status", None)
+                lat = safe_float(getattr(msg, "latitude", None), None)
+                lng = safe_float(getattr(msg, "longitude", None), None)
+                if lat not in (None, 0.0) and lng not in (None, 0.0):
+                    self.current_lat = lat
+                    self.current_lng = lng
+                    with self.lock:
+                        self.gps_state["lat"] = lat
+                        self.gps_state["lng"] = lng
+                with self.lock:
+                    self.gps_state["gll_status"] = self.latest_gll_status
+                print(f"[GPS GLL] status={self.latest_gll_status} lat={self.current_lat:.6f} lng={self.current_lng:.6f}")
+            except Exception as e:
+                print("[GPS GLL ERROR]", e)
+
+        self._record_live_gps(now)
+        self.root.after(0, self.update_live_marker, self.current_lat, self.current_lng)
+        self.nmea_tail.appendleft(raw)
+        self.root.after(0, self._update_info)
+        self.root.after(0, self._refresh_gps_debug_text)
+
+    def _record_live_gps(self, now: float):
+        """Update the latest GPS state and persist at most one sample per second.
+
+        NMEA streams can contain several sentence types during the same second.
+        The GUI still receives those updates, but gps_log.csv is rate-limited to
+        the 1 Hz technical sampling rate used by the interpolation pipeline.
+        """
+        with self.lock:
+            self.gps_state["lat"] = self.current_lat
+            self.gps_state["lng"] = self.current_lng
+            self.gps_state["signal_dbhz"] = self.latest_signal_dbhz
+            self.gps_state["num_sats"] = self.latest_num_sats
+            self.gps_state["fix_quality"] = self.latest_fix_quality
+            self.gps_state["hdop"] = self.latest_hdop
+            self.gps_state["pdop"] = self.latest_pdop
+            self.gps_state["vdop"] = self.latest_vdop
+            self.gps_state["altitude"] = self.latest_altitude
+            self.gps_state["geoid_sep"] = self.latest_geoid_sep
+            self.gps_state["speed_knots"] = self.latest_speed_knots
+            self.gps_state["speed_kmh"] = self.latest_speed_kmh
+            self.gps_state["course_deg"] = self.latest_course_deg
+
+        if not (self.recording_active and self.current_session_dir is not None):
+            return
+
+        if self.last_gps_log_ts is not None and (now - self.last_gps_log_ts) < GPS_LOG_INTERVAL_S:
+            return
+
+        gps_csv = self.current_session_dir / DEFAULT_GPS_CSV
+        with gps_csv.open("a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                f"{now:.3f}",
+                f"{self.current_lat:.6f}",
+                f"{self.current_lng:.6f}",
+                "" if self.latest_signal_dbhz is None else f"{self.latest_signal_dbhz:.1f}",
+                "" if self.latest_num_sats is None else str(self.latest_num_sats),
+                "" if self.latest_fix_quality is None else str(self.latest_fix_quality),
+                "" if self.latest_hdop is None else f"{self.latest_hdop:.2f}",
+                "" if self.latest_pdop is None else f"{self.latest_pdop:.2f}",
+                "" if self.latest_vdop is None else f"{self.latest_vdop:.2f}",
+                "" if self.latest_altitude is None else f"{self.latest_altitude:.2f}",
+                "" if self.latest_geoid_sep is None else f"{self.latest_geoid_sep:.2f}",
+                "" if self.latest_speed_knots is None else f"{self.latest_speed_knots:.2f}",
+                "" if self.latest_speed_kmh is None else f"{self.latest_speed_kmh:.2f}",
+                "" if self.latest_course_deg is None else f"{self.latest_course_deg:.2f}",
+                self.gps_mode,
+                self.offline_pattern,
+            ])
+        self.last_gps_log_ts = now
+
+    def _offline_step(self):
+        now = time.time()
+        dt = max(0.05, now - self.offline_last_ts)
+        self.offline_last_ts = now
+
+        # synthetic but plausible signal metrics
+        base_sig = 42.0
+        wobble = 4.0 * math.sin(now / 7.0)
+        self.latest_signal_dbhz = max(25.0, min(55.0, base_sig + wobble))
+        self.latest_num_sats = 9 + int(abs(2 * math.sin(now / 11.0)))
+        self.latest_fix_quality = 1
+        self.latest_hdop = 0.9 + 0.15 * abs(math.sin(now / 5.0))
+        self.latest_pdop = 1.2 + 0.2 * abs(math.cos(now / 6.0))
+        self.latest_vdop = 1.5 + 0.25 * abs(math.sin(now / 4.0))
+        self.latest_altitude = 12.0 + 0.5 * math.sin(now / 13.0)
+        self.latest_geoid_sep = 45.0 + 0.2 * math.cos(now / 9.0)
+        self.latest_speed_knots = self.offline_speed_mps * 1.94384
+        self.latest_speed_kmh = self.offline_speed_mps * 3.6
+
+        if self.offline_pattern == "CIRCLE":
+            r = self.offline_circle_radius_m
+            omega = self.offline_speed_mps / max(r, 1e-6)
+            self.offline_angle_rad = (self.offline_angle_rad + omega * dt) % (2 * math.pi)
+            east_m = r * math.cos(self.offline_angle_rad)
+            north_m = r * math.sin(self.offline_angle_rad)
+            self.current_lat = self.offline_center_lat + meters_to_lat_deg(north_m)
+            self.current_lng = self.offline_center_lng + meters_to_lng_deg(east_m, self.offline_center_lat)
+            self.latest_course_deg = (math.degrees(self.offline_angle_rad) + 90.0) % 360.0
+        else:
+            heading = math.radians(self.offline_heading_deg)
+            dn = self.offline_speed_mps * dt * math.cos(heading)
+            de = self.offline_speed_mps * dt * math.sin(heading)
+            self.offline_straight_lat += meters_to_lat_deg(dn)
+            self.offline_straight_lng += meters_to_lng_deg(de, self.offline_straight_lat)
+            self.current_lat = self.offline_straight_lat
+            self.current_lng = self.offline_straight_lng
+            self.latest_course_deg = self.offline_heading_deg % 360.0
+
+        self.latest_rmc_status = "A"
+        self.latest_gll_status = "A"
+        self.latest_satellites_in_view = self.latest_num_sats + 3
+        self.latest_max_snr = self.latest_signal_dbhz + 3.0
+
+        with self.lock:
+            self.gps_state["mode"] = self.gps_mode
+            self.gps_state["pattern"] = self.offline_pattern
+            self.gps_state["last_sentence_type"] = "SIM"
+            self.gps_state["last_raw_sentence"] = f"SIM {self.offline_pattern}"
+            self.gps_state["lat"] = self.current_lat
+            self.gps_state["lng"] = self.current_lng
+            self.gps_state["signal_dbhz"] = self.latest_signal_dbhz
+            self.gps_state["num_sats"] = self.latest_num_sats
+            self.gps_state["fix_quality"] = self.latest_fix_quality
+            self.gps_state["hdop"] = self.latest_hdop
+            self.gps_state["pdop"] = self.latest_pdop
+            self.gps_state["vdop"] = self.latest_vdop
+            self.gps_state["altitude"] = self.latest_altitude
+            self.gps_state["geoid_sep"] = self.latest_geoid_sep
+            self.gps_state["speed_knots"] = self.latest_speed_knots
+            self.gps_state["speed_kmh"] = self.latest_speed_kmh
+            self.gps_state["course_deg"] = self.latest_course_deg
+            self.gps_state["rmc_status"] = self.latest_rmc_status
+            self.gps_state["gll_status"] = self.latest_gll_status
+            self.gps_state["gsv_satellites_in_view"] = self.latest_satellites_in_view
+            self.gps_state["gsv_avg_snr"] = self.latest_signal_dbhz
+            self.gps_state["gsv_max_snr"] = self.latest_max_snr
+            self.gps_state["gsa_fix_type"] = 3
+
+        debug_lines = [
+            f"[SIM RMC] ts={now:.3f} status=A lat={self.current_lat:.6f} lng={self.current_lng:.6f} speed={self.latest_speed_knots:.2f}kn course={self.latest_course_deg:.1f}",
+            f"[SIM VTG] speed={self.latest_speed_knots:.2f}kn/{self.latest_speed_kmh:.2f}kmh course={self.latest_course_deg:.1f}",
+            f"[SIM GGA] fix={self.latest_fix_quality} sats={self.latest_num_sats} hdop={self.latest_hdop:.2f} alt={self.latest_altitude:.2f}",
+            f"[SIM GSA] fix_type=3 pdop={self.latest_pdop:.2f} hdop={self.latest_hdop:.2f} vdop={self.latest_vdop:.2f}",
+            f"[SIM GSV] sats_in_view={self.latest_satellites_in_view} avg_snr={self.latest_signal_dbhz:.1f} max_snr={self.latest_max_snr:.1f}",
+            f"[SIM GLL] status=A lat={self.current_lat:.6f} lng={self.current_lng:.6f}",
+        ]
+        for line in reversed(debug_lines):
+            self.nmea_tail.appendleft(line)
+
+        print(
+            f"[GPS OFFLINE-{self.offline_pattern}] ts={now:.3f} "
+            f"signal={self.latest_signal_dbhz:.1f} dB-Hz sats={self.latest_num_sats} "
+            f"fix={self.latest_fix_quality} lat={self.current_lat:.6f} lng={self.current_lng:.6f}"
+        )
+
+        self._record_live_gps(now)
+        self.root.after(0, self.update_live_marker, self.current_lat, self.current_lng)
+        self.root.after(0, self._update_info)
+        self.root.after(0, self._refresh_gps_debug_text)
+
+    def offline_step(self):
+        """Backward-compatible alias for the offline GPS simulator."""
+        return self._offline_step()
+
+    # session recording
+    def start_recording_thread(self):
+        if self.replay_active:
+            messagebox.showwarning("Recording", "Playback sedang berjalan. Hentikan playback terlebih dahulu.")
+            return
+        if self.playback_thread and self.playback_thread.is_alive():
+            return
+        if self.current_session_dir is None:
+            messagebox.showinfo("Recording", "Buat atau pilih sesi terlebih dahulu.")
+            return
+        if self.recording_active:
+            return
+        self.stop_record_event.clear()
+        self.playback_thread = threading.Thread(target=self.record_session, daemon=True)
+        self.playback_thread.start()
+
+
+    def _display_frame(self, frame_bgr, is_rgb=False):
+        """Update camera preview safely from a worker thread."""
+        if frame_bgr is None:
+            return
+        try:
+            if not is_rgb:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            else:
+                frame_rgb = frame_bgr
+            frame_rgb = cv2.resize(frame_rgb, (360, 240))
+            with self.lock:
+                self.frame_display = frame_rgb
+        except Exception as e:
+            print("[DISPLAY ERROR]", e)
+
+
+    def _open_rpi_camera(self):
+        """Open Raspberry Pi camera at 1280x720 / 24 fps when supported."""
+        if Picamera2 is not None:
+            try:
+                picam2 = Picamera2()
+                config = picam2.create_video_configuration(
+                    main={"size": (VIDEO_WIDTH, VIDEO_HEIGHT), "format": "RGB888"},
+                    controls={"FrameRate": VIDEO_FPS}
+                )
+                picam2.configure(config)
+                picam2.start()
+                time.sleep(1.0)
+                print("[CAMERA] Raspberry Pi Camera opened with Picamera2")
+                return ("PICAMERA2", picam2)
+            except Exception as e:
+                print(f"[CAMERA] Picamera2 failed: {e}")
+
+        cap = cv2.VideoCapture(0)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
+            print("[CAMERA] Fallback OpenCV camera /dev/video0 opened")
+            return ("OPENCV", cap)
+
+        print("[CAMERA ERROR] Raspberry Pi Camera could not be opened.")
+        return (None, None)
+
+    def _get_session_start_timestamp(self, session_dir=None):
+        """Return the first captured frame's Unix timestamp for a session."""
+        session_dir = session_dir or self.current_session_dir or self.selected_session_dir
+        if session_dir is None:
+            return None
+        try:
+            session_dir = Path(session_dir)
+            cache_key = str(session_dir.resolve())
+        except Exception:
+            cache_key = str(session_dir)
+        cached = self._session_start_timestamp_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        timestamps = []
+        frames_path = Path(session_dir) / DEFAULT_FRAME_CSV
+        if frames_path.exists():
+            for row in read_csv_dicts(frames_path):
+                value = safe_float(row.get("frame_timestamp"), None)
+                if value is not None:
+                    timestamps.append(value)
+                    break  # recorded_frames.csv is written in capture order
+
+        # Compatibility for older sessions missing recorded_frames.csv values.
+        if not timestamps:
+            detections_path = Path(session_dir) / DEFAULT_DET_CSV
+            if detections_path.exists():
+                for row in read_csv_dicts(detections_path):
+                    value = safe_float(row.get("frame_timestamp"), None)
+                    if value is not None:
+                        timestamps.append(value)
+                if timestamps:
+                    timestamps = [min(timestamps)]
+
+        if timestamps:
+            self._session_start_timestamp_cache[cache_key] = timestamps[0]
+            return timestamps[0]
+        return None
+
+    def _format_session_timestamp(self, timestamp, session_dir=None, start_timestamp=None):
+        """Format a stored absolute timestamp as elapsed session time."""
+        ts = safe_float(timestamp, None)
+        if ts is None:
+            return "-"
+        if start_timestamp is None:
+            start_timestamp = self._get_session_start_timestamp(session_dir)
+        return format_elapsed_timestamp(ts, start_timestamp)
+
+    def _read_camera_frame(self, camera_type, camera):
+        """Read a frame and timestamp it immediately after capture returns.
+
+        The timestamp is taken before color conversion, rotation, resizing, or
+        recording so subsequent processing latency does not shift the frame time.
+        Returns ``(frame_bgr, unix_timestamp)`` or ``(None, None)`` on failure.
+        """
+        if camera_type == "PICAMERA2":
+            try:
+                # Picamera2's "RGB888" stream is exposed by capture_array()
+                # in BGR byte order for direct use with OpenCV. Treat this as
+                # BGR already; converting RGB2BGR here would swap red and blue.
+                frame = camera.capture_array()
+                frame_ts = time.time()  # timestamp immediately after frame reception
+            except Exception as e:
+                print(f"[CAMERA READ ERROR] {e}")
+                return None, None
+        else:
+            ret, frame = camera.read()
+            frame_ts = time.time()  # timestamp immediately after frame reception
+            if not ret or frame is None:
+                return None, None
+
+        # -1 = flip horizontally and vertically (rotate image 180 degrees).
+        frame = cv2.flip(frame, -1)
+        return frame, frame_ts
+
+    def _close_rpi_camera(self, camera_type, camera):
+        if camera is None:
+            return
+        try:
+            if camera_type == "PICAMERA2":
+                camera.stop()
+                camera.close()
+            else:
+                camera.release()
+        except Exception as e:
+            print(f"[CAMERA CLOSE ERROR] {e}")
+
+    def record_session(self):
+        if self.current_session_dir is None:
+            return
+
+        self.follow_gps = True
+        self.last_gps_log_ts = None
+        self.recording_active = True
+        self.inference_active = False
+        self._set_status("Recording video + GPS")
+        self._set_preview_text(f"Recording: {self.current_session_dir.name}")
+
+        self.session_manager.update_status(self.current_session_dir, "recording", recording_done=False, inference_done=False)
+        self.refresh_sessions()
+
+        source_mode = self.current_session_meta.get("input_source", self.input_source) if self.current_session_meta else self.input_source
+        camera_type = None
+        camera = None
+        cap = None
+        writer = None
+
+        if source_mode == "RPI_CAMERA":
+            camera_type, camera = self._open_rpi_camera()
+            if camera is None:
+                self.recording_active = False
+                self._set_status("Camera open failed")
+                self._set_preview_text("Preview: Raspberry Pi Camera open failed")
+                self.root.after(0, lambda: messagebox.showerror("Camera", "Raspberry Pi Camera tidak dapat dibuka."))
+                return
+            src_fps = VIDEO_FPS
+            frame_delay = 1.0 / VIDEO_FPS
+            camera_video_path = self.current_session_dir / DEFAULT_CAMERA_VIDEO
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(
+                str(camera_video_path), fourcc, src_fps, (VIDEO_WIDTH, VIDEO_HEIGHT)
+            )
+            if not writer.isOpened():
+                self._close_rpi_camera(camera_type, camera)
+                self.recording_active = False
+                self._set_status("Camera recording open failed")
+                self.root.after(0, lambda: messagebox.showerror("Camera", "Tidak dapat membuat file camera_recording.mp4."))
+                return
+            print(f"[CAMERA] Recording to {camera_video_path}")
+        else:
+            cap = cv2.VideoCapture(VIDEO_PATH)
+            if not cap.isOpened():
+                self.recording_active = False
+                self._set_status("Video open failed")
+                self._set_preview_text("Preview: video open failed")
+                self.root.after(0, lambda: messagebox.showerror("Video", f"Tidak bisa membuka video: {VIDEO_PATH}"))
+                return
+            source_fps = cap.get(cv2.CAP_PROP_FPS)
+            if not source_fps or source_fps <= 1:
+                source_fps = VIDEO_FPS
+            # Dummy video is played as a simulated live camera at the target 24 fps.
+            frame_delay = 1.0 / VIDEO_FPS
+            print(
+                f"[VIDEO] Opened {VIDEO_PATH}, source_fps={source_fps:.2f}, "
+                f"target_fps={VIDEO_FPS:.2f}"
+            )
+
+        frame_csv = self.current_session_dir / DEFAULT_FRAME_CSV
+        frame_count = 0
+
+        try:
+            while not self.shutdown_event.is_set():
+                if self.stop_record_event.is_set():
+                    print("[CTRL] Stop recording requested.")
+                    break
+
+                t0 = time.time()
+                if source_mode == "RPI_CAMERA":
+                    frame, frame_ts = self._read_camera_frame(camera_type, camera)
+                    if frame is None or frame_ts is None:
+                        print("[CAMERA] Frame read failed.")
+                        break
+                else:
+                    ret, frame = cap.read()
+                    frame_ts = time.time()  # timestamp immediately after frame retrieval
+                    if not ret or frame is None:
+                        print("[VIDEO] End of video reached.")
+                        break
+
+                # Set this session's relative time origin from the first captured frame.
+                if frame_count == 0:
+                    try:
+                        cache_key = str(Path(self.current_session_dir).resolve())
+                        self._session_start_timestamp_cache[cache_key] = frame_ts
+                    except Exception:
+                        pass
+
+                # Standardize every recorded/input frame to 1280 x 720.
+                if frame.shape[1] != VIDEO_WIDTH or frame.shape[0] != VIDEO_HEIGHT:
+                    frame = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT))
+
+                if source_mode == "RPI_CAMERA" and writer is not None:
+                    # `frame` is normalized to OpenCV's BGR channel order by
+                    # _read_camera_frame() (Picamera2 RGB888 is already BGR in
+                    # the returned array; OpenCV VideoCapture also returns BGR).
+                    # VideoWriter expects BGR, so write it directly. Swapping to
+                    # RGB here causes the saved video's red/blue channels to flip.
+                    writer.write(frame)
+
+                with self.lock:
+                    self.session_frame_count += 1
+
+                with frame_csv.open("a", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow([frame_count, f"{frame_ts:.3f}"])
+
+                preview = frame.copy()
+                cv2.rectangle(preview, (0, 0), (preview.shape[1], 40), (0, 0, 0), -1)
+                display_ts = self._format_session_timestamp(
+                    frame_ts, self.current_session_dir,
+                    start_timestamp=self._get_session_start_timestamp(self.current_session_dir),
+                )
+                cv2.putText(
+                    preview,
+                    f"RECORD | session={self.current_session_dir.name} | frame={frame_count} | t={display_ts}",
+                    (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                self._display_frame(preview)
+                frame_count += 1
+
+                elapsed = time.time() - t0
+                sleep_time = max(0.0, frame_delay - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        except Exception as e:
+            print("[RECORD ERROR]", e)
+            self.nmea_tail.appendleft(f"[RECORD ERROR] {e}")
+            self.root.after(0, self._refresh_gps_debug_text)
+        finally:
+            if source_mode == "RPI_CAMERA":
+                try:
+                    if writer is not None:
+                        writer.release()
+                except Exception:
+                    pass
+                self._close_rpi_camera(camera_type, camera)
+            else:
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+
+            self.recording_active = False
+            self.stop_record_event.clear()
+
+            self.session_manager.update_status(
+                self.current_session_dir,
+                "recorded",
+                recording_done=True,
+                inference_done=False,
+                frames_recorded=frame_count,
+                source_video=(str(self.current_session_dir / DEFAULT_CAMERA_VIDEO) if source_mode == "RPI_CAMERA" else VIDEO_PATH),
+                input_source=source_mode,
+                input_source_label=("Raspberry Pi Camera" if source_mode == "RPI_CAMERA" else "Dummy Video"),
+                last_update=datetime.now().isoformat(timespec="seconds"),
+            )
+            self.refresh_sessions()
+
+            self._set_status("Recording finished. Press Start Inference to process this session.")
+            self._set_preview_text(f"Recorded: {self.current_session_dir.name} | frames={frame_count}")
+            self.start_infer_btn.config(state="normal")
+
+            if frame_count == 0:
+                self._set_preview_text(f"Recorded: {self.current_session_dir.name} | frames=0")
+
+            messagebox.showinfo(
+                "Recording selesai",
+                f"Rekaman sesi '{self.current_session_dir.name}' selesai.\nTekan Start Inference untuk memproses data."
+            )
+
+
+    # inference process
+    def start_inference_for_session(self, session_dir: Path):
+        if not self.model_ready.is_set() or self.session is None:
+            messagebox.showwarning("Model", "Model ONNX masih dimuat atau gagal dimuat. Tunggu sampai status Ready.")
+            return
+        if self.inference_active:
+            return
+
+        meta = self.session_manager.load_meta(session_dir)
+        if not messagebox.askyesno("Konfirmasi Inferensi", f"Mulai inferensi untuk sesi '{session_dir.name}'?"):
+            return
+
+        self.stop_infer_event.clear()
+        self.infer_thread = threading.Thread(target=self.run_inference_for_current_session, daemon=True)
+        self.infer_thread.start()
+
+
+    def run_inference_for_current_session(self):
+        if not self.model_ready.is_set() or self.session is None:
+            self.root.after(0, lambda: messagebox.showwarning("Model", "Model ONNX belum siap."))
+            self.root.after(0, lambda: self.start_infer_btn.config(state="normal"))
+            return
+
+        if self.current_session_dir is None:
+            self.start_infer_btn.config(state="normal")
+            return
+
+        session_dir = self.current_session_dir
+        meta = self.session_manager.load_meta(session_dir)
+        frames = read_csv_dicts(session_dir / DEFAULT_FRAME_CSV)
+        gps_rows = read_csv_dicts(session_dir / DEFAULT_GPS_CSV)
+
+        if not frames:
+            messagebox.showwarning("Inference", "Data frame perekaman tidak ditemukan.")
+            self.start_infer_btn.config(state="normal")
+            return
+        if len(gps_rows) < 2:
+            messagebox.showwarning("Inference", "Data GPS tidak cukup untuk interpolasi.")
+            self.start_infer_btn.config(state="normal")
+            return
+
+        frame_timestamps = []
+        for row in frames:
+            ts = safe_float(row.get("frame_timestamp"), None)
+            if ts is not None:
+                frame_timestamps.append(ts)
+
+        gps_obs = []
+        for row in gps_rows:
+            gps_obs.append({
+                "timestamp": safe_float(row.get("timestamp"), None),
+                "lat": safe_float(row.get("lat"), None),
+                "lng": safe_float(row.get("lng"), None),
+                "signal_dbhz": safe_float(row.get("signal_dbhz"), None),
+                "num_sats": safe_int(row.get("num_sats"), None),
+                "fix_quality": safe_int(row.get("fix_quality"), None),
+                "hdop": safe_float(row.get("hdop"), None),
+                "pdop": safe_float(row.get("pdop"), None),
+                "vdop": safe_float(row.get("vdop"), None),
+            })
+        gps_obs = [g for g in gps_obs if g["timestamp"] is not None and g["lat"] is not None and g["lng"] is not None]
+        gps_obs.sort(key=lambda x: x["timestamp"])
+
+        if not gps_obs:
+            messagebox.showwarning("Inference", "GPS observation invalid.")
+            self.start_infer_btn.config(state="normal")
+            return
+
+        self.inference_active = True
+        self._set_status("Inference running")
+        self._set_preview_text(f"Inference: {session_dir.name}")
+        print(f"[INFER] Session {session_dir.name}: frames={len(frame_timestamps)} gps={len(gps_obs)}")
+
+        out_csv = session_dir / DEFAULT_DET_CSV
+        with out_csv.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "frame_index",
+                "frame_timestamp",
+                "frame_image",
+                "label",
+                "confidence",
+                "gps_before_timestamp",
+                "gps_after_timestamp",
+                "interp_lat",
+                "interp_lng",
+                "gps_before_lat",
+                "gps_before_lng",
+                "gps_after_lat",
+                "gps_after_lng",
+                "gps_before_signal_dbhz",
+                "gps_after_signal_dbhz",
+                "gps_mode",
+                "gps_pattern",
+            ])
+
+        video_source = meta.get("source_video", VIDEO_PATH)
+        if meta.get("input_source") == "RPI_CAMERA":
+            camera_video = session_dir / DEFAULT_CAMERA_VIDEO
+            video_source = str(camera_video) if camera_video.exists() else video_source
+        cap = cv2.VideoCapture(video_source)
+        if not cap.isOpened():
+            self.inference_active = False
+            self.start_infer_btn.config(state="normal")
+            messagebox.showerror("Video", f"Tidak bisa membuka video sumber: {video_source}")
+            return
+
+        detections_for_map = []
+        frame_idx = 0
+
+        try:
+            while frame_idx < len(frame_timestamps):
+                if self.stop_infer_event.is_set() or self.shutdown_event.is_set():
+                    print("[CTRL] Inference stopped.")
+                    break
+
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Keep inference frames at the same technical input resolution
+                # for both Raspberry Pi Camera recordings and dummy-video sessions.
+                if frame.shape[1] != VIDEO_WIDTH or frame.shape[0] != VIDEO_HEIGHT:
+                    frame = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT))
+
+                frame_ts = frame_timestamps[frame_idx]
+                annotated = self.infer_single_frame(
+                    frame.copy(),
+                    frame_idx,
+                    frame_ts,
+                    gps_obs,
+                    out_csv,
+                    detections_for_map,
+                )
+                self._display_frame(annotated)
+                frame_idx += 1
+        except Exception as e:
+            print("[INFER ERROR]", e)
+            self.nmea_tail.appendleft(f"[INFER ERROR] {e}")
+            self.root.after(0, self._refresh_gps_debug_text)
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+            self.session_manager.update_status(
+                session_dir,
+                "inferred",
+                inference_done=True,
+                recording_done=True,
+                detections=len(detections_for_map),
+                last_inference=datetime.now().isoformat(timespec="seconds"),
+            )
+            self.refresh_sessions()
+
+            self.inference_active = False
+            self.start_infer_btn.config(state="normal")
+            self._set_status(f"Inference finished. detections={len(detections_for_map)}")
+            self._set_preview_text(f"Inference done: {session_dir.name} | det={len(detections_for_map)}")
+            print(f"[INFER] Done. detections={len(detections_for_map)}")
+            self.load_session_to_map(session_dir)
+
+            messagebox.showinfo(
+                "Inference selesai",
+                f"Inference sesi '{session_dir.name}' selesai.\nJumlah deteksi: {len(detections_for_map)}"
+            )
+
+
+    def show_detection_list(self):
+        """Show all detections for the selected/current session with class counts and filtering."""
+        session_dir = self.current_session_dir or self.selected_session_dir
+        if session_dir is None:
+            messagebox.showinfo("Daftar Kerusakan", "Pilih atau muat sesi terlebih dahulu.")
+            return
+
+        det_path = session_dir / DEFAULT_DET_CSV
+        if not det_path.exists():
+            messagebox.showinfo(
+                "Daftar Kerusakan",
+                f"Sesi '{session_dir.name}' belum memiliki hasil inferensi. Jalankan Start Inference terlebih dahulu."
+            )
+            return
+
+        rows = read_csv_dicts(det_path)
+        # Only count rows with a label; tolerate older/partially written CSV files.
+        rows = [r for r in rows if (r.get("label") or "").strip()]
+        # Stable source IDs keep clicks associated with the correct detection after
+        # filtering or sorting the displayed table.
+        for source_index, row in enumerate(rows):
+            row["_source_index"] = str(source_index)
+        session_start_ts = self._get_session_start_timestamp(session_dir)
+        if session_start_ts is None:
+            valid_det_times = [safe_float(r.get("frame_timestamp"), None) for r in rows]
+            valid_det_times = [t for t in valid_det_times if t is not None]
+            if valid_det_times:
+                session_start_ts = min(valid_det_times)
+                try:
+                    self._session_start_timestamp_cache[str(Path(session_dir).resolve())] = session_start_ts
+                except Exception:
+                    pass
+
+        class_order = list(CLASS_NAMES)
+        counts = {name: 0 for name in class_order}
+        for row in rows:
+            label = (row.get("label") or "").strip()
+            if label in counts:
+                counts[label] += 1
+
+        popup = tk.Toplevel(self.root)
+        popup.title(f"Daftar Kerusakan Terdeteksi - {session_dir.name}")
+        popup.geometry("920x620")
+        popup.minsize(760, 460)
+        popup.transient(self.root)
+
+        outer = tk.Frame(popup, padx=12, pady=12, bg="white")
+        outer.pack(fill="both", expand=True)
+        tk.Label(
+            outer, text=f"Daftar Kerusakan Terdeteksi\nSesi: {session_dir.name}",
+            font=("Arial", 14, "bold"), bg="white", justify="left", anchor="w"
+        ).pack(fill="x", pady=(0, 10))
+
+        # Summary cards: counts for each class and total number of detections.
+        stats_frame = tk.Frame(outer, bg="white")
+        stats_frame.pack(fill="x", pady=(0, 12))
+        for col in range(5):
+            stats_frame.grid_columnconfigure(col, weight=1, uniform="stats")
+        stat_items = [
+            ("Longitudinal Crack", counts["Longitudinal Crack"]),
+            ("Transverse Crack", counts["Transverse Crack"]),
+            ("Alligator Crack", counts["Alligator Crack"]),
+            ("Potholes", counts["Potholes"]),
+            ("TOTAL", len(rows)),
+        ]
+        for col, (name, value) in enumerate(stat_items):
+            card = tk.Frame(stats_frame, bg="#f1f5f9", bd=1, relief="solid", padx=6, pady=8)
+            card.grid(row=0, column=col, padx=3, sticky="nsew")
+            tk.Label(card, text=name, bg="#f1f5f9", font=("Arial", 8, "bold"), wraplength=130).pack()
+            tk.Label(card, text=str(value), bg="#f1f5f9", font=("Arial", 18, "bold")).pack(pady=(3, 0))
+
+        filter_frame = tk.Frame(outer, bg="white")
+        filter_frame.pack(fill="x", pady=(0, 8))
+        tk.Label(filter_frame, text="Tampilkan jenis:", bg="white", font=("Arial", 10)).pack(side="left")
+        filter_var = tk.StringVar(value="Semua jenis")
+        filter_box = ttk.Combobox(
+            filter_frame, textvariable=filter_var, state="readonly", width=24,
+            values=["Semua jenis"] + class_order
+        )
+        filter_box.pack(side="left", padx=(8, 12))
+        shown_var = tk.StringVar(value=f"Menampilkan {len(rows)} deteksi")
+        tk.Label(filter_frame, textvariable=shown_var, bg="white", anchor="e").pack(side="right")
+
+        table_frame = tk.Frame(outer, bg="white")
+        table_frame.pack(fill="both", expand=True)
+        columns = ("no", "label", "confidence", "timestamp", "latitude", "longitude")
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=16)
+        headings = {
+            "no": "No.", "label": "Jenis Kerusakan", "confidence": "Confidence",
+            "timestamp": "Timestamp Frame", "latitude": "Latitude", "longitude": "Longitude"
+        }
+        widths = {"no": 55, "label": 200, "confidence": 100, "timestamp": 170, "latitude": 125, "longitude": 125}
+        for col in columns:
+            tree.heading(col, text=headings[col])
+            tree.column(col, width=widths[col], anchor="center", stretch=(col == "label"))
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="we")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        displayed_detection_by_iid = {}
+
+        def detection_from_row(row):
+            """Convert a detections.csv row to the same structure used by map markers."""
+            image_rel = (row.get("frame_image") or "").strip()
+            image_abs = None
+            if image_rel:
+                image_candidate = Path(image_rel)
+                if not image_candidate.is_absolute():
+                    image_candidate = session_dir / image_candidate
+                if image_candidate.exists():
+                    image_abs = str(image_candidate.resolve())
+
+            return {
+                "detection_id": safe_int(row.get("frame_index"), 0),
+                "frame_index": row.get("frame_index", "-"),
+                "frame_timestamp": row.get("frame_timestamp", "-"),
+                "session_start_timestamp": session_start_ts,
+                "label": row.get("label", "Damage"),
+                "confidence": row.get("confidence", "-"),
+                "interp_lat": row.get("interp_lat", "-"),
+                "interp_lng": row.get("interp_lng", "-"),
+                "image_path": image_abs,
+            }
+
+        def on_detection_row_click(event):
+            # A single click on a data row opens the shared detail popup; clicks on
+            # headings/blank space are ignored.
+            iid = tree.identify_row(event.y)
+            detection = displayed_detection_by_iid.get(iid)
+            if detection is not None:
+                self.show_detection_popup(detection)
+                return "break"
+            return None
+
+        def sort_key(row, col):
+            value = row.get(col, "")
+            if col in ("confidence",):
+                return safe_float(value, -1.0)
+            if col in ("latitude", "longitude"):
+                return safe_float(value, 0.0)
+            if col == "no":
+                return safe_int(value, 0)
+            return str(value).lower()
+
+        sort_state = {"column": "no", "reverse": False}
+        def render(*_args):
+            selected = filter_var.get()
+            filtered = [r for r in rows if selected == "Semua jenis" or (r.get("label") or "").strip() == selected]
+            # Default order groups detections by the four class types, then timestamp/frame.
+            if sort_state["column"] == "class_order":
+                filtered.sort(key=lambda r: (class_order.index(r.get("label")) if r.get("label") in class_order else len(class_order), safe_float(r.get("frame_timestamp"), 0)))
+            else:
+                field_map = {"no": "frame_index", "label": "label", "confidence": "confidence", "timestamp": "frame_timestamp", "latitude": "interp_lat", "longitude": "interp_lng"}
+                field = field_map[sort_state["column"]]
+                filtered.sort(key=lambda r: sort_key(r, field), reverse=sort_state["reverse"])
+            tree.delete(*tree.get_children())
+            displayed_detection_by_iid.clear()
+            for idx, row in enumerate(filtered, start=1):
+                iid = f"det_{row.get('_source_index', idx)}"
+                tree.insert("", "end", iid=iid, values=(
+                    idx,
+                    row.get("label", "-"),
+                    f"{safe_float(row.get('confidence'), 0.0):.4f}",
+                    format_elapsed_timestamp(
+                        safe_float(row.get("frame_timestamp"), None), session_start_ts
+                    ),
+                    row.get("interp_lat", "-"),
+                    row.get("interp_lng", "-"),
+                ))
+                displayed_detection_by_iid[iid] = detection_from_row(row)
+            shown_var.set(f"Menampilkan {len(filtered)} dari {len(rows)} deteksi — klik baris untuk melihat gambar/detail")
+
+        def on_heading(col):
+            if col == "label":
+                # Clicking the class heading cycles to the four-class grouping.
+                sort_state["column"] = "class_order"
+                sort_state["reverse"] = False
+            else:
+                if sort_state["column"] == col:
+                    sort_state["reverse"] = not sort_state["reverse"]
+                else:
+                    sort_state["column"] = col
+                    sort_state["reverse"] = False
+            render()
+
+        for col in columns:
+            tree.heading(col, command=lambda c=col: on_heading(c))
+        filter_box.bind("<<ComboboxSelected>>", render)
+        tree.bind("<ButtonRelease-1>", on_detection_row_click)
+        render()
+        tk.Button(outer, text="Tutup", command=popup.destroy, width=12).pack(pady=(10, 0))
+
+    def _save_detection_frame(self, frame, session_dir: Path, detection_id: int) -> str | None:
+        """Save a persistent copy of the detected frame inside the session folder."""
+        try:
+            frame_dir = session_dir / "detection_frames"
+            frame_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"detection_{detection_id:04d}.jpg"
+            path = frame_dir / filename
+            if cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+                return str(path.relative_to(session_dir))
+        except Exception as e:
+            print(f"[FRAME SAVE ERROR] {e}")
+        return None
+
+    def _marker_click_command(self, detection: dict):
+        return lambda _marker=None, d=detection: self.show_detection_popup(d)
+
+    def show_detection_popup(self, detection: dict):
+        """Display the stored detection frame and metadata in a popup."""
+        popup = tk.Toplevel(self.root)
+        popup.title(f"Deteksi - {detection.get('label', 'Damage')}")
+        popup.geometry("780x650")
+        popup.transient(self.root)
+
+        outer = tk.Frame(popup, bg="white")
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+
+        image_path = detection.get("image_path")
+        img = None
+        if image_path:
+            try:
+                img = Image.open(image_path)
+                img.thumbnail((740, 500), Image.Resampling.LANCZOS)
+            except Exception as e:
+                print(f"[POPUP IMAGE ERROR] {e}")
+
+        if img is not None:
+            imgtk = ImageTk.PhotoImage(img)
+            image_label = tk.Label(outer, image=imgtk, bg="black")
+            image_label.image = imgtk
+            image_label.pack(fill="both", expand=True, pady=(0, 10))
+        else:
+            image_label = tk.Label(
+                outer,
+                text="Gambar frame tidak tersedia",
+                bg="black",
+                fg="white",
+                height=20,
+            )
+            image_label.pack(fill="both", expand=True, pady=(0, 10))
+
+        display_frame_timestamp = format_elapsed_timestamp(
+            safe_float(detection.get("frame_timestamp"), None),
+            safe_float(detection.get("session_start_timestamp"), None)
+            or self._get_session_start_timestamp(),
+        )
+        info = (
+            f"Jenis kerusakan : {detection.get('label', '-') }\n"
+            f"Confidence      : {detection.get('confidence', '-') }\n"
+            f"Timestamp frame : {display_frame_timestamp}\n"
+            f"Latitude        : {detection.get('interp_lat', '-') }\n"
+            f"Longitude       : {detection.get('interp_lng', '-') }\n"
+            f"Koordinat       : ({detection.get('interp_lat', '-')}, {detection.get('interp_lng', '-')})"
+        )
+        tk.Label(
+            outer,
+            text=info,
+            bg="white",
+            justify="left",
+            anchor="w",
+            font=("Arial", 11),
+        ).pack(fill="x")
+
+        tk.Button(outer, text="Tutup", command=popup.destroy, width=10).pack(pady=(10, 0))
+
+    def infer_single_frame(self, frame, frame_idx, frame_ts, gps_obs, out_csv: Path, detections_for_map):
+        original = frame.copy()
+        h, w = frame.shape[:2]
+
+        if self.session is None:
+            return self._annotate_phase(original, "NO MODEL", frame_ts, (0, 0, 255))
+
+        img_input = preprocess(frame)
+        try:
+            outputs = self.session.run(None, {self.input_name: img_input})
+        except Exception as e:
+            print("[INFER ERROR]", e)
+            return self._annotate_phase(original, "INFER ERROR", frame_ts, (0, 0, 255))
+
+        preds = np.squeeze(outputs[0]).T
+        boxes, scores, class_ids = [], [], []
+
+        for pred in preds:
+            if pred.shape[0] < 5:
+                continue
+
+            class_scores = pred[4:]
+            conf = float(np.max(class_scores))
+            if conf > CONF_THRESHOLD:
+                class_id = int(np.argmax(class_scores))
+                cx, cy, bw, bh = pred[:4]
+
+                x = int((cx - bw / 2) * w / IMG_SIZE)
+                y = int((cy - bh / 2) * h / IMG_SIZE)
+                width = int(bw * w / IMG_SIZE)
+                height = int(bh * h / IMG_SIZE)
+
+                boxes.append([x, y, width, height])
+                scores.append(conf)
+                class_ids.append(class_id)
+
+        indices = nms(boxes, scores)
+        canvas = self._annotate_phase(original, f"INFERENCE | frame={frame_idx}", frame_ts, (255, 255, 0))
+
+        if not indices:
+            return canvas
+
+        for i in indices:
+            label = CLASS_NAMES[class_ids[i]] if class_ids[i] < len(CLASS_NAMES) else f"Class {class_ids[i]}"
+            confidence = scores[i]
+            x, y, width, height = boxes[i]
+            x2 = x + width
+            y2 = y + height
+
+            cv2.rectangle(canvas, (x, y), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(canvas, f"{label} {confidence:.2f}", (max(0, x), max(25, y - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+
+            g0, g1 = self.get_surrounding_gps_from_list(frame_ts, gps_obs)
+            if g0 is None or g1 is None:
+                print(f"[DETECTION] frame_ts={frame_ts:.3f} label={label} conf={confidence:.2f}")
+                print("  [WARN] GPS before/after not found.")
+                continue
+
+            interp_lat, interp_lng, alpha = self.interpolate_coord(frame_ts, g0, g1)
+
+            sig0 = "N/A" if g0["signal_dbhz"] is None else f"{g0['signal_dbhz']:.1f} dB-Hz"
+            sig1 = "N/A" if g1["signal_dbhz"] is None else f"{g1['signal_dbhz']:.1f} dB-Hz"
+
+            print("\n[DETECTION]")
+            print(f"  frame_ts   = {frame_ts:.3f}")
+            print(f"  label      = {label}")
+            print(f"  confidence = {confidence:.2f}")
+            print("[GPS BEFORE]")
+            print(f"  ts={g0['timestamp']:.3f} | lat={g0['lat']:.6f} | lng={g0['lng']:.6f} | signal={sig0}")
+            print("[GPS AFTER]")
+            print(f"  ts={g1['timestamp']:.3f} | lat={g1['lat']:.6f} | lng={g1['lng']:.6f} | signal={sig1}")
+            print(f"[INTERP] alpha={alpha:.4f} -> lat={interp_lat:.6f}, lng={interp_lng:.6f}")
+
+            detection_id = len(detections_for_map) + 1
+
+            cv2.putText(canvas, f"INTERP: {interp_lat:.6f}, {interp_lng:.6f}", (10, canvas.shape[0] - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+            session_start_ts = self._get_session_start_timestamp(self.current_session_dir)
+            gps_before_display = format_elapsed_timestamp(g0["timestamp"], session_start_ts)
+            gps_after_display = format_elapsed_timestamp(g1["timestamp"], session_start_ts)
+            cv2.putText(canvas, f"GPS: {gps_before_display} -> {gps_after_display}", (10, canvas.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+
+            image_rel = self._save_detection_frame(canvas, self.current_session_dir, detection_id)
+            image_abs = str(self.current_session_dir / image_rel) if image_rel else None
+
+            with out_csv.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([
+                    frame_idx,
+                    f"{frame_ts:.3f}",
+                    image_rel or "",
+                    label,
+                    f"{confidence:.4f}",
+                    f"{g0['timestamp']:.3f}",
+                    f"{g1['timestamp']:.3f}",
+                    f"{interp_lat:.6f}",
+                    f"{interp_lng:.6f}",
+                    f"{g0['lat']:.6f}",
+                    f"{g0['lng']:.6f}",
+                    f"{g1['lat']:.6f}",
+                    f"{g1['lng']:.6f}",
+                    "" if g0["signal_dbhz"] is None else f"{g0['signal_dbhz']:.1f}",
+                    "" if g1["signal_dbhz"] is None else f"{g1['signal_dbhz']:.1f}",
+                    self.gps_mode,
+                    self.offline_pattern,
+                ])
+
+            detection = {
+                "detection_id": detection_id,
+                "frame_index": frame_idx,
+                "frame_timestamp": f"{frame_ts:.3f}",
+                "label": label,
+                "confidence": f"{confidence:.2f}",
+                "interp_lat": f"{interp_lat:.6f}",
+                "interp_lng": f"{interp_lng:.6f}",
+                "image_path": image_abs,
+            }
+            detections_for_map.append(detection)
+        return canvas
+
+    def get_surrounding_gps_from_list(self, frame_ts, gps_obs):
+        if len(gps_obs) < 2:
+            return None, None
+        before = [g for g in gps_obs if g["timestamp"] <= frame_ts]
+        after = [g for g in gps_obs if g["timestamp"] >= frame_ts]
+        if not before or not after:
+            return None, None
+        return before[-1], after[0]
+
+    def interpolate_coord(self, frame_ts, g0, g1):
+        t0 = g0["timestamp"]
+        t1 = g1["timestamp"]
+        if t1 == t0:
+            return g0["lat"], g0["lng"], 0.0
+        alpha = (frame_ts - t0) / (t1 - t0)
+        interp_lat = g0["lat"] + alpha * (g1["lat"] - g0["lat"])
+        interp_lng = g0["lng"] + alpha * (g1["lng"] - g0["lng"])
+        return interp_lat, interp_lng, alpha
+
+    def _annotate_phase(self, frame, text, ts=None, color=(0, 255, 0)):
+        canvas = frame.copy()
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 40), (0, 0, 0), -1)
+        if ts is None:
+            label = text
+        else:
+            session_dir = self.replay_session_dir if self.replay_active and self.replay_session_dir else (self.current_session_dir or self.selected_session_dir)
+            display_ts = self._format_session_timestamp(ts, session_dir)
+            label = f"{text} | t={display_ts}"
+        cv2.putText(canvas, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+        return canvas
+
+    # map rendering
+    def _clear_session_overlays(self):
+        """Remove all map overlays from the current session."""
+        for marker in list(getattr(self, "damage_markers", [])):
+            try:
+                marker.delete()
+            except Exception:
+                pass
+        if hasattr(self, "damage_markers"):
+            self.damage_markers.clear()
+
+        marker = getattr(self, "session_route_marker", None)
+        if marker is not None:
+            try:
+                marker.delete()
+            except Exception:
+                pass
+        self.session_route_marker = None
+    def show_session_status_only(self, session_dir: Path):
+        meta, frames, gps, dets = self.session_manager.load_session_payload(session_dir)
+        if gps:
+            first = gps[0]
+            lat = safe_float(first.get("lat"), self.current_lat) or self.current_lat
+            lng = safe_float(first.get("lng"), self.current_lng) or self.current_lng
+            self.map_widget.set_position(lat, lng)
+            self.map_widget.set_zoom(self.zoom_level)
+        self._clear_session_overlays()
+        self.follow_gps = False
+        self._set_preview_text(f"Session loaded: {session_dir.name} | no inference yet")
+
+    def load_session_to_map(self, session_dir: Path):
+        meta, frames, gps_rows, det_rows = self.session_manager.load_session_payload(session_dir)
+        self._clear_session_overlays()
+        self.follow_gps = False
+
+        points = []
+        for row in gps_rows:
+            lat = safe_float(row.get("lat"), None)
+            lng = safe_float(row.get("lng"), None)
+            if lat is not None and lng is not None:
+                points.append((lat, lng))
+
+        if points:
+            center = points[0]
+            self.map_widget.set_position(center[0], center[1])
+            self.map_widget.set_zoom(self.zoom_level)
+
+        # Cache the session-relative time origin for all marker detail popups.
+        session_start_ts = self._get_session_start_timestamp(session_dir)
+        if session_start_ts is None:
+            det_times = [safe_float(row.get("frame_timestamp"), None) for row in det_rows]
+            det_times = [ts for ts in det_times if ts is not None]
+            if det_times:
+                session_start_ts = min(det_times)
+                try:
+                    self._session_start_timestamp_cache[str(Path(session_dir).resolve())] = session_start_ts
+                except Exception:
+                    pass
+
+        # show damage markers
+        damage_points = []
+        for idx, row in enumerate(det_rows):
+            lat = safe_float(row.get("interp_lat"), None)
+            lng = safe_float(row.get("interp_lng"), None)
+            label = row.get("label", "Damage")
+            if lat is None or lng is None:
+                continue
+            damage_points.append((lat, lng))
+
+            image_rel = row.get("frame_image", "").strip()
+            image_abs = None
+            if image_rel:
+                candidate = session_dir / image_rel
+                if candidate.exists():
+                    image_abs = str(candidate)
+
+            detection = {
+                "detection_id": idx + 1,
+                "frame_index": row.get("frame_index", "-"),
+                "frame_timestamp": row.get("frame_timestamp", "-"),
+                "session_start_timestamp": session_start_ts,
+                "label": label,
+                "confidence": row.get("confidence", "-"),
+                "interp_lat": f"{lat:.6f}",
+                "interp_lng": f"{lng:.6f}",
+                "image_path": image_abs,
+            }
+            marker = self.map_widget.set_marker(
+                lat,
+                lng,
+                text="",
+                command=self._marker_click_command(detection),
+            )
+            self.damage_markers.append(marker)
+
+        if damage_points:
+            self.map_widget.set_position(damage_points[0][0], damage_points[0][1])
+            self.map_widget.set_zoom(self.zoom_level)
+            self._set_preview_text(f"Loaded inferred session: {session_dir.name} | detections={len(damage_points)}")
+        else:
+            self._set_preview_text(f"Loaded session: {session_dir.name} | no detections")
+
+    # UI loop
+    def update_live_marker(self, lat, lng):
+        try:
+            # During replay the recorded GPS timeline controls the map.
+            if self.replay_active:
+                return
+            self.live_marker.set_position(lat, lng)
+            if self.follow_gps:
+                self.map_widget.set_position(lat, lng)
+        except Exception as e:
+            print("[MAP ERROR]", e)
+
+    def update_ui(self):
+        with self.lock:
+            frame = self.frame_display.copy() if self.frame_display is not None else None
+
+        if frame is not None:
+            img = Image.fromarray(frame)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.camera_frame.imgtk = imgtk
+            self.camera_frame.configure(image=imgtk)
+
+        self.root.after(30, self.update_ui)
+
+    # cleanup
+    def on_close(self):
+        self.shutdown_event.set()
+        self.stop_record_event.set()
+        self.stop_infer_event.set()
+        self.stop_replay_event.set()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    app = DetectionApp()
+    app.run()
